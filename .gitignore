@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 私有源配置（指向私有仓库的路径与文件名，不入库）
+blog.local.json

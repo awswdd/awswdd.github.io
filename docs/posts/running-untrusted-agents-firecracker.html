@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="我构建的是一个持续会话式的 agent 运行环境。每个用户有一个 workspace，agent 可以读写文件、调用工具、安装依赖、执行命令；在 coding 场景下，它还会运行 bash、npm install、构建脚本和测试脚本。">
+<title>把不可信 agent 放进 Firecracker：零凭证 microVM 的工程账 · Wdd&#x27;s Blog</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#content">跳到正文</a>
+
+<header class="site-header">
+  <div class="site-header__inner">
+    <a class="site-brand" href="../index.html">Wdd&#x27;s Blog</a>
+    <button id="toc-toggle" class="toc-toggle" aria-expanded="false" aria-controls="toc">
+      <span class="toc-toggle__icon" aria-hidden="true"></span>
+      <span class="toc-toggle__label">目录</span>
+    </button>
+  </div>
+  <div class="reading-progress" id="reading-progress"></div>
+</header>
+
+<div class="layout">
+  <main class="content" id="content">
+    <article class="article">
+      <header class="article__hero">
+        <a class="article__back" href="../index.html">← 返回文章列表</a>
+        <p class="article__eyebrow">工程笔记</p>
+        <h1 class="article__title">把不可信 agent 放进 Firecracker：零凭证 microVM 的工程账</h1>
+        <p class="article__byline">内容创作：wdd · 美化编辑：codex (gpt-5.5) · 审核：wdd</p>
+        <p class="article__meta">约 3655 字 · 阅读约 10 分钟</p>
+      </header>
+      <p>我构建的是一个持续会话式的 agent 运行环境。每个用户有一个 workspace，agent 可以读写文件、调用工具、安装依赖、执行命令；在 coding 场景下，它还会运行 <code>bash</code>、<code>npm install</code>、构建脚本和测试脚本。</p>
+<p>这个模型里，隔离边界不能只停在进程和容器。<a href="https://docs.docker.com/engine/security/">Docker Engine security</a> 讲得很清楚：容器隔离依赖 namespaces、cgroups、capabilities、mounts 等 Linux 机制。对普通业务服务，这是很好的工程权衡；对“模型驱动的未知操作链 + 用户 workspace + 多租户”，我不把共享宿主内核当最后一道墙。</p>
+<p>Firecracker 在这里解决两件事：启动快，隔离硬。但真正花时间的不是“把 VM 拉起来”。真正的工程账在后面：文件怎么进出、网络怎么收口、凭证为什么不能进 VM、agent 怎么分发、snapshot 恢复后怎么挂盘、workspace 又怎么持久化。</p>
+<h2 id="firecracker"><a class="toclink" href="#firecracker">Firecracker 为什么又回到牌桌上</a></h2>
+<p>Firecracker 不是新技术。<a href="https://aws.amazon.com/blogs/aws/firecracker-lightweight-virtualization-for-serverless-computing/">AWS 在 2018 年发布并开源 Firecracker</a>，目标就是给 Lambda、Fargate 这类多租户 serverless 平台同时提供 VM 级隔离和低冷启动成本。同一时期，<a href="https://katacontainers.io/">Kata Containers</a> 也在把轻量 VM 做成“像容器一样使用”的安全容器运行时。</p>
+<p>它后来没有替代普通容器，原因很直接：大多数服务不值得为 VM 隔离额外承担 rootfs、kernel、块设备、网络模型、snapshot 和 host 侧代理的复杂度。容器在工程上太顺手，生态也太完整；只要 workload 是你自己构建、自己部署、自己运维的服务，容器就是更便宜的默认选项。</p>
+<p>agent sandbox 把这个老问题翻了出来，不是因为大家突然重新发现了 Firecracker，而是 workload 变了。平台能控制 VM 模板、设备模型和出向代理，VM 内运行的却是模型驱动的未知命令序列。这个形态更接近 provider-controlled runtime 里的不可信 workload，而不是普通服务部署。</p>
+<p>这个判断也能从外部生态看到。Docker 的 <a href="https://docs.docker.com/ai/sandboxes/">AI Sandboxes</a> 文档直接写到 “AI coding agents in isolated microVM sandboxes”；它的<a href="https://docs.docker.com/ai/sandboxes/security/">安全文档</a>把 primary trust boundary 放在 microVM 上，并明确说 raw credentials never enter the VM，网络经 host 侧代理出去。</p>
+<p>Firecracker 的取舍也足够明确。<a href="https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md">Firecracker specification</a> 写到，在最小内核和 rootfs 下，从 <code>InstanceStart</code> 到 guest <code>/sbin/init</code> 可以做到 125ms 以内，VMM 线程内存开销不超过 5MiB。<a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#threat-containment">Firecracker design</a> 把 guest vCPU 线程视为启动后即可运行恶意代码，隔离依赖 KVM、seccomp、cgroups、namespaces 和 jailer。<a href="https://github.com/firecracker-microvm/firecracker/blob/main/FAQ.md#what-is-the-difference-between-firecracker-and-qemu">FAQ</a> 列出的设备很少：<code>virtio-net</code>、<code>virtio-balloon</code>、<code>virtio-block</code>、<code>virtio-vsock</code>、serial console 和一个最小 keyboard。少设备降低攻击面，也会在后面直接限制共享目录、热插拔和网络形态。</p>
+<p>我在裸金属机器上做过一组项目内实测。这不是 Firecracker 官方承诺，也不是通用 benchmark，只用于判断 VM 能不能进入在线路径：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: right;">实测结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>VM 冷启动</td>
+<td style="text-align: right;">1.31s</td>
+</tr>
+<tr>
+<td>snapshot resume</td>
+<td style="text-align: right;">0.22s</td>
+</tr>
+<tr>
+<td>guest 内 ext4 经 virtio-blk 写 1GB</td>
+<td style="text-align: right;">1.2 GB/s</td>
+</tr>
+<tr>
+<td>guest 内 ext4 经 virtio-blk 读 1GB</td>
+<td style="text-align: right;">3.1 GB/s</td>
+</tr>
+<tr>
+<td><code>npm install</code> 约 880 个包</td>
+<td style="text-align: right;">22s</td>
+</tr>
+</tbody>
+</table>
+<p>后续预热池把 Firecracker VM “取用到 ready”的时间做到约 443ms。这个数字让架构边界可以收紧：读文件、写文件、grep、执行命令、跑一个 agent turn，都先确保 VM 在，再在 VM 内完成。对象存储退出在线读写路径，只保留为持久化真源。</p>
+<p>这一步很关键。在线路径如果绕过 VM，系统会有两套文件语义：对象存储里一份，VM ext4 里一份；控制面能写，VM 也能写。后面的同步、冲突和写权归属会越来越复杂。收进 VM 后，<code>/workspace</code> 的 ext4 就是当前态，VM 是唯一在线写者，host 只负责调度、代理和持久化。</p>
+<h2 id="vm"><a class="toclink" href="#vm">VM 只负责执行，不负责持有能力</a></h2>
+<p>我把运行时边界定成一句话：VM 是执行边界，不是能力边界。</p>
+<p>agent 在 VM 里读写 <code>/workspace</code>、执行命令；云凭证、对象存储权限、模型服务真实凭证、网络出口策略留在 host 侧。VM 被攻破时，攻击者只能拿到 VM 内可见的工作区状态，拿不到云账号能力。</p>
+<p>第一步是去掉普通网络面。早期实现里还有 TAP、veth、network namespace、NAT、iptables；后来全部砍掉。现在 VM 没有 <code>eth0</code>、没有 NAT、没有公网路由。管理通道和出向请求都走 vsock。Firecracker 的 <a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md">vsock 文档</a>定义了 guest <code>AF_VSOCK</code> 到 host Unix domain socket 的通信模型；<a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#threat-containment">design 文档</a>也明确说 Firecracker 不做网络过滤，guest 出站流量应由 host 过滤。我的选择是再往前走一步：不给 guest 配普通网卡，让所有出向都先变成一条 host 可识别、可审计、可拒绝的 vsock 请求。</p>
+<p>VM 内的 agent 仍然使用普通 HTTP 客户端，请求发到 <code>127.0.0.1:8090</code>。这个 loopback 端口由 guest-agent egress shim 监听，再桥到 host 的 vsock 端口：</p>
+<pre><code class="language-text">VM 内 agent
+  -&gt; 127.0.0.1:8090
+  -&gt; guest-agent egress shim
+  -&gt; AF_VSOCK
+  -&gt; host egress proxy
+  -&gt; 被允许的 upstream
+</code></pre>
+<p>guest 侧没有路由选择权，host 侧 egress proxy 决定放行、身份和重签。</p>
+<p>第二步是凭证不进 VM。VM 里没有 <code>/root/.aws</code>，没有 AWS 访问密钥环境变量，agent 卷不包含 <code>.pem</code> 或 secret；临时凭证也不进 VM，因为在“不可信 agent 可执行任意命令”的前提下，临时凭证只是有效期更短的可窃取能力。</p>
+<p>模型调用路径压成四步：</p>
+<ol>
+<li>VM 内 agent 发请求，请求里只有占位凭证，例如 <code>AWS_ACCESS_KEY_ID=agent-egress-placeholder</code>。</li>
+<li>请求经 loopback shim 和 vsock 到 host egress proxy。</li>
+<li>egress proxy 用 host 侧真实凭证重新签名，再访问 Bedrock 等上游服务。</li>
+<li>VM 自始至终摸不到真实凭证。</li>
+</ol>
+<p>占位值只用于兼容要求环境变量存在的 SDK，不参与认证。</p>
+<p>重签还有一个容易踩坑的细节：<a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html#create-canonical-request">AWS SigV4 文档</a>要求签名覆盖 canonical request，并提醒不要把 <code>connection</code>、<code>user-agent</code>、<code>transfer-encoding</code>、<code>upgrade</code> 这类 hop-by-hop header 放进签名。Bedrock 路由会丢弃 VM 请求里的 <code>Authorization</code> 和旧 <code>x-amz-*</code>，只保留受控 <code>content-type</code>，再由 host 签名器生成新的 <code>authorization</code> / <code>x-amz-*</code>。否则中间层或 HTTP 客户端改一个 header，就会触发 <code>SignatureDoesNotMatch</code>。</p>
+<p>身份也不靠请求体自报。每个 VM 在 jailer chroot 里有自己的 vsock UDS 和一个 sidecar identity 文件，内容是 <code>tenant_id</code>、<code>workspace_id</code>、<code>vm_id</code>。egress proxy 周期扫描这些 sidecar，为每个 VM 起一条专属 UDS listener。请求从哪条 UDS 进来，身份就固定在哪个 VM 上。keep-alive 多请求、恶意请求头、请求体自报身份，都不能改变连接级身份。</p>
+<p>最终数据流只有三条：</p>
+<pre><code class="language-text">文件读写：VM 内 agent -&gt; /workspace ext4
+模型调用：VM 内 agent -&gt; vsock -&gt; host egress proxy -&gt; 上游模型服务
+持久化：host -&gt; dm-snapshot -&gt; aws s3 sync -&gt; 对象存储
+</code></pre>
+<p>只有第一条发生在 VM 内；后两条都在 host 边界上完成。</p>
+<h2 id="agent-vm-rootfs"><a class="toclink" href="#agent-vm-rootfs">agent 进 VM，但不进 rootfs</a></h2>
+<p>当 workspace 的读、写、执行都已经经 VM，agent loop 继续留在 host 会制造一层多余的工具网关。早期 loop 在 host，通过 <code>write_file</code>、<code>apply_patch</code>、<code>grep</code> 这类受限工具把操作送进 VM。这个设计在“host 侧 loop 才是可信执行者”的阶段是合理的；但当文件、命令、项目上下文都进入 VM 后，这层网关就只剩维护成本。</p>
+<p>我把 agent loop 搬进 VM。安全模型随之改变：不再试图证明每个工具 API 都拦得住，而是让 agent 在 VM 内直接 <code>open</code> 文件、执行命令；外层用 KVM 边界、零网络面、凭证不进 VM、出向 broker 来收住能力。</p>
+<p>接下来要解决的是 agent 怎么进入 VM。</p>
+<p>把 agent 烤进 rootfs 最省事，也最不适合长期运行。每次 agent 升级都要重烤镜像；多个 agent、多个版本一多，rootfs 会越来越胖，发布和回滚也会变慢。项目里曾经把某个 agent CLI 和 Node runtime 烤进 rootfs，镜像约 1.7GB。拆成 agent 卷后，rootfs 降到约 785MB，只保留 OS、init、sshd 和 guest-agent。</p>
+<p>rootfs 和 agent 卷的职责要分开：</p>
+<ul>
+<li>rootfs 负责 VM 怎么启动、怎么挂 workspace、怎么和 host 通信，应该稳定、少变、少重烤。</li>
+<li>agent 卷负责这个 workspace 运行哪个 agent、哪个版本、带哪些 runtime，应该能快速发布、回滚和复用。</li>
+</ul>
+<p>Firecracker 也把分发方式限定得很清楚。<a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#storage">design 文档的 storage 部分</a>说 block devices 由 host 文件作为 backing；<a href="https://github.com/firecracker-microvm/firecracker/blob/main/README.md#features--capabilities">README</a>也把磁盘描述为 file-backed block device。相反，把 host 文件系统共享进 guest 仍然是单独的开放议题，可以看这个 <a href="https://github.com/firecracker-microvm/firecracker/issues/1180">Host Filesystem Sharing issue</a>。生产稳定路径是 <code>virtio-blk</code>，不是共享目录。</p>
+<p>最后的形态是：每个 <code>agent × 版本</code> 打成一个只读 ext4 镜像，经 <code>virtio-blk</code> 挂进 VM，例如 <code>/opt/agents/0</code>、<code>/opt/agents/1</code>。workspace 也是 ext4，经 <code>virtio-blk</code> 暴露；区别是 workspace 可写，agent 卷只读。</p>
+<p>发布链路因此变成：</p>
+<pre><code class="language-text">agent 发布 -&gt; 生成只读 ext4 镜像 -&gt; host cache/content hash
+VM 激活 -&gt; 选择 agent 镜像 -&gt; 挂到预留只读槽
+guest-agent -&gt; mount /opt/agents/N
+agent turn -&gt; 注入 PATH 或可执行文件路径
+</code></pre>
+<p>只读不是装饰。agent 是平台发布物，应该可复现、可缓存、可回滚；workspace 才是用户可写状态。多个 VM 指向同一个只读 backing file，还能复用 host page cache。新版本使用新内容路径，不需要在运行中的 VM 里做缓存失效。</p>
+<h2 id="_1"><a class="toclink" href="#_1">不能热加新盘，就预留占位槽</a></h2>
+<p>agent 卷确定走 <code>virtio-blk</code> 后，下一个假设是：从 golden snapshot 恢复 VM，需要哪个 agent，就临时给它加哪块盘。这个假设在实测里不成立。</p>
+<p>Firecracker v1.16 的 MMIO 路径上，对 snapshot 里从未声明过的新盘执行：</p>
+<pre><code class="language-text">PUT /drives/vdNEW   -&gt; 400 PCI is not enabled
+PATCH /drives/vdNEW -&gt; 400 Device not found
+</code></pre>
+<p>也就是说，在我使用的 MMIO 快照路径里，运行中或 resume 后不能新增一块全新的 <code>virtio-blk</code> 盘。这不等于 Firecracker 完全没有 hotplug。<a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/device-hotplug.md">device hotplug 文档</a>写得很清楚：hotplug 目前是 Developer Preview，要求启动时启用 <code>--enable-pci</code>，并且 “Device hotplugging is not supported with MMIO transport”。官方 PCI hotplug 的存在，不改变 MMIO snapshot 路径的约束。</p>
+<p>设备数也有限。当时的 MMIO 配置下，第 17 个块设备启动时报：</p>
+<pre><code class="language-text">MMIO transport error: Failed to allocate requested resource
+</code></pre>
+<p>所以块设备不能当成无限插件系统。它适合挂 workspace、少量 agent 卷，不适合承载“10 个 agent × 100 种软件 × 多版本”的任意组合。</p>
+<p>最终方案是把动态需求前移到模板期：生成 golden VM 时，预先声明 workspace 槽和若干 agent 占位槽；拍 snapshot 时，这些设备已经被 Firecracker 认识，但 guest 还没有把它们挂载成真实目录。激活 workspace 时，从 golden <code>LoadSnapshot</code>，microVM 进入 Paused 状态；host 用 <code>PATCH /drives/{id}</code> 把占位 backing file 换成真实 workspace ext4 和 agent ext4，再 resume。</p>
+<p>这个时机来自 Firecracker 自身的行为。<a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#loading-snapshots">snapshot 文档</a>写到，<code>LoadSnapshot</code> 成功后 microVM 处于 <code>Paused</code> 状态，需要 resume 才会运行；同一份文档还说明 snapshot 里的 disk files 由使用者管理。<a href="https://github.com/firecracker-microvm/firecracker/blob/main/README.md#features--capabilities">README</a>也把“change the backing file for a block device, before or after the guest boots”列为能力之一。</p>
+<p>一次激活的顺序是：</p>
+<pre><code class="language-text">host:  LoadSnapshot(golden)  -&gt; microVM Paused
+host:  PATCH workspace slot  -&gt; 真实 workspace ext4
+host:  PATCH agent slot 0    -&gt; 主 agent 只读 ext4
+host:  PATCH agent slot 1    -&gt; 可选子 agent 只读 ext4
+host:  Resume
+guest: mount /workspace
+guest: mount /opt/agents/0, /opt/agents/1
+host:  run turn
+</code></pre>
+<p>这里有两个硬规则。</p>
+<p>第一，slot 身份稳定。比如 <code>vdb</code> 永远是 workspace，<code>vdc</code>、<code>vdd</code>、<code>vde</code> 是 agent slots。设备语义不能在不同启动里漂移，否则 guest-agent 的挂载和排障都会变复杂。</p>
+<p>第二，mount 延迟到 resume 后由 guest-agent 做。golden 里只保留设备存在性，不提前把占位盘挂成 <code>/workspace</code> 或 <code>/opt/agents/N</code>。Firecracker 允许换 backing file，不代表 guest 文件系统缓存会忘掉旧盘；如果快照里已经有挂载态，resume 后再换盘，就是让 guest 带着旧文件系统状态看一块新盘。</p>
+<p>这套机制的实测成本很小：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th style="text-align: right;">实测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>snapshot/load</code></td>
+<td style="text-align: right;">约 16ms</td>
+</tr>
+<tr>
+<td>每块盘 <code>PATCH</code> 换 backing</td>
+<td style="text-align: right;">约 9ms</td>
+</tr>
+<tr>
+<td>guest 串行 mount 两个只读卷</td>
+<td style="text-align: right;">约 6ms</td>
+</tr>
+<tr>
+<td>多卷净增</td>
+<td style="text-align: right;">约 15-20ms</td>
+</tr>
+</tbody>
+</table>
+<p>它落在约 443ms 的取用预算里，换来的是一份 agent-agnostic 的 golden snapshot：agent 升级不重烤 rootfs，同一个 VM 可以挂主 agent 和子 agent，只读 agent 卷可以跨 VM 共享 page cache。</p>
+<h2 id="agent"><a class="toclink" href="#agent">软件不要和 agent 抢设备槽</a></h2>
+<p>agent 走只读卷，不代表所有能力都应该走卷。Firecracker 的设备槽有限，软件、runtime、工具链又是长尾：版本多、用户选择多、安装方式也多。如果每个软件版本都变成一块 VM 设备，槽位会先耗尽，平台还要维护大量镜像。</p>
+<p>我把 agent 和软件分开处理。agent 是平台受控发布物，数量少，需要版本化和回滚，适合只读 <code>virtio-blk</code> 卷。软件、runtime、工具链作为 workspace 文件写入 <code>/workspace</code>，随 workspace 一起持久化，通过 <code>PATH</code> 等环境变量启用。这个方案没有“所有东西都模块化挂载”整齐，但它尊重 Firecracker 的设备模型：块设备留给少数边界清楚的发布物，长尾状态进入 workspace。</p>
+<h2 id="_2"><a class="toclink" href="#_2">持久化也不能破凭证边界</a></h2>
+<p>workspace 最终要落到对象存储，但 S3 凭证不能进 VM。持久化必须在 host 侧完成。</p>
+<p>运行时，VM 内的 <code>/workspace</code> 是本地 ext4。host 对 workspace 块设备做 <code>dm-snapshot</code>，拿到只读视图，再把这个视图挂到 host 上，用 host 自己的云凭证执行 <code>aws s3 sync</code>，把文件级增量同步到对象存储。生命周期分三段：</p>
+<pre><code class="language-text">启动前：对象存储原始文件树 -&gt; host 本地运行目录 -&gt; workspace ext4
+运行中：VM 写 /workspace -&gt; host dm-snapshot -&gt; aws s3 sync
+停机/checkpoint：host 收口同步 -&gt; 可选 fsfreeze -&gt; 对象存储成为恢复真源
+</code></pre>
+<p>S3 存原始文件，不存整块 ext4 镜像。ext4 是运行时载体，原始文件树是持久化真源。这样用户离开平台时拿到的是目录树和文件名，不是只能由平台解释的整盘镜像。</p>
+<p>这条路径有几个实现细节决定它能不能可靠运行。</p>
+<p>第一，host 不能直接挂 live ext4。那块 ext4 正被 Firecracker 作为 guest block device 使用，host 并发挂载会读到脏 journal 或陈旧元数据。<code>dm-snapshot</code> 给 host 一个短命 COW 视图：guest 继续写 origin，host 只读 snapshot，两边不互相踩。</p>
+<p>第二，高频同步不做 <code>fsfreeze</code>。实测 <code>fsfreeze</code> 冻结窗口约 260ms；每 5s freeze 一次，对 <code>npm install</code>、build、大量解压写入会形成周期性顿挫。后来我把一致性拆成两层：高频持久化默认做不 freeze 的 <code>dm-snapshot</code>，拿类似突然断电后的崩溃一致视图；turn 结束或用户显式保存版本时，再做 <code>fsfreeze + dm-snapshot</code>，拿更强的静默一致性。</p>
+<p>第三，workspace 块设备需要 <code>cache_type: Writeback</code>。默认配置下，即使 guest 静止并执行 <code>fsfreeze</code>，host 快照仍可能落后 guest 已经 flush 的数据。改成 <code>Writeback</code> 后，guest flush 能落到 host fd 的 fsync，host 侧快照和 guest 视图才能对齐。</p>
+<p>第四，运行中同步对删除要保守。高频 sync 尽快推新文件和改动，但不要因为一次中间态扫描就删除远端对象；停机、checkpoint 或明确收口点，再做更强的删除同步。对用户数据来说，远端多留一个旧文件通常比误删更容易恢复。</p>
+<p>这条链路和模型调用路径的原则一致：VM 负责产生文件系统状态，host 负责把状态转成持久化事实；VM 始终没有对象存储凭证。</p>
+<h2 id="vmm"><a class="toclink" href="#vmm">VMM 进程本身也要隔离</a></h2>
+<p>microVM 不是唯一边界。Firecracker VMM 是 host 进程，生产里也要有自己的进程级隔离。</p>
+<p><a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#sandboxing">Firecracker design</a> 推荐通过 <code>jailer</code> 启动 Firecracker。jailer 设置 chroot、cgroup，丢权限，再 exec Firecracker；Firecracker 自己也会安装 seccomp 过滤器，限制 host syscall。</p>
+<p>我的 host 侧按这个模型组织：每个 microVM 有自己的 jailer chroot，rootfs、workspace 设备、agent 卷、vsock UDS 都放在这个边界里。egress identity sidecar 也跟 chroot 同生命周期：VM 启动时写入，VM 停掉后 chroot 清理，egress proxy 下一轮 reconcile 就撤掉对应 listener。</p>
+<p>这样即使 VMM 自身出问题，外层还有 chroot、cgroup、seccomp 和权限下降兜住下一层。</p>
+<h2 id="_3"><a class="toclink" href="#_3">最后留下来的原则</a></h2>
+<p>Firecracker 的价值和限制来自同一件事：它足够小。小设备模型带来更窄攻击面，也迫使系统围着边界设计。</p>
+<p>安全这条线最后收束成一句话：VM 可以执行代码，但不能持有能力。模型调用由 host egress proxy 重签，S3 持久化由 host 做，VM 没有普通网卡，管理和出向都走 vsock。agent loop 可以进入 VM，因为真正的能力仍然在 VM 外面。</p>
+<p>分发这条线也类似：agent 不进 rootfs，不依赖共享目录，而是按 <code>agent × 版本</code> 打成只读 <code>virtio-blk</code> 镜像。MMIO snapshot 路径不能 resume 后新增盘，就在 golden snapshot 里预留槽位，Paused 阶段 <code>PATCH</code> 换 backing。设备槽留给少量平台发布物，软件、runtime、工具链进入 workspace。</p>
+<p>状态这条线则是把“当前态”和“持久化真源”拆开：VM 内 ext4 是在线当前态，host 用 <code>dm-snapshot</code> 提取文件级视图，再同步到对象存储；VM 始终没有对象存储凭证。Firecracker VMM 自己再用 jailer、chroot、cgroup、seccomp 关一层。</p>
+<p>边界内的东西越少、越静态，系统越容易守住。把凭证和网络出口放在 VM 外，把动态设备需求前移到模板期，把长尾状态放进 workspace，Firecracker 才能同时服务启动速度和安全隔离这两个目标。</p>
+    </article>
+    <footer class="site-footer">
+      <p><a href="../index.html">← 返回 Wdd&#x27;s Blog 文章列表</a></p>
+      <p>© Wdd&#x27;s Blog · 本页由 <code>build.py</code> 从 Markdown 静态渲染。</p>
+    </footer>
+  </main>
+
+  <aside class="toc-sidebar" id="toc" aria-label="文章大纲">
+    <div class="toc-sidebar__inner">
+      <p class="toc-sidebar__title">大纲</p>
+      <nav class="toc-nav">
+        <ul>
+<li><a href="#firecracker">Firecracker 为什么又回到牌桌上</a></li>
+<li><a href="#vm">VM 只负责执行，不负责持有能力</a></li>
+<li><a href="#agent-vm-rootfs">agent 进 VM，但不进 rootfs</a></li>
+<li><a href="#_1">不能热加新盘，就预留占位槽</a></li>
+<li><a href="#agent">软件不要和 agent 抢设备槽</a></li>
+<li><a href="#_2">持久化也不能破凭证边界</a></li>
+<li><a href="#vmm">VMM 进程本身也要隔离</a></li>
+<li><a href="#_3">最后留下来的原则</a></li>
+</ul>
+      </nav>
+    </div>
+  </aside>
+</div>
+
+<div class="toc-backdrop" id="toc-backdrop" hidden></div>
+
+<script src="../assets/toc.js" defer></script>
+</body>
+</html>

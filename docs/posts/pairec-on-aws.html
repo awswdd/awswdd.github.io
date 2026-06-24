@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="把一套 PAI-Rec 风格的推荐链路(召回 → 过滤 → 排序 → 重排 → 回流 + A/B 实验)完整搬到 AWS。 这篇文章不讲&quot;推荐算法&quot;,讲的是工程落地:AWS 上做推荐缺什么、有哪些落地路线、为什么选 PaiRec 引擎、 落地时撞到哪些问题、具体怎么改造(含代码量…">
+<title>在 AWS 上落地一套生产级推荐系统:基于开源 PaiRec 的全链路改造实践 · Wdd&#x27;s Blog</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#content">跳到正文</a>
+
+<header class="site-header">
+  <div class="site-header__inner">
+    <a class="site-brand" href="../index.html">Wdd&#x27;s Blog</a>
+    <button id="toc-toggle" class="toc-toggle" aria-expanded="false" aria-controls="toc">
+      <span class="toc-toggle__icon" aria-hidden="true"></span>
+      <span class="toc-toggle__label">目录</span>
+    </button>
+  </div>
+  <div class="reading-progress" id="reading-progress"></div>
+</header>
+
+<div class="layout">
+  <main class="content" id="content">
+    <article class="article">
+      <header class="article__hero">
+        <a class="article__back" href="../index.html">← 返回文章列表</a>
+        <p class="article__eyebrow">工程笔记</p>
+        <h1 class="article__title">在 AWS 上落地一套生产级推荐系统:基于开源 PaiRec 的全链路改造实践</h1>
+        <p class="article__byline">内容创作：wdd · 美化编辑：codex (gpt-5.5) · 审核：wdd</p>
+        <p class="article__meta">约 5527 字 · 阅读约 16 分钟</p>
+      </header>
+      <blockquote>
+<p>把一套 PAI-Rec 风格的推荐链路(召回 → 过滤 → 排序 → 重排 → 回流 + A/B 实验)完整搬到 AWS。
+这篇文章不讲"推荐算法",讲的是<strong>工程落地</strong>:AWS 上做推荐缺什么、有哪些落地路线、为什么选 PaiRec 引擎、
+落地时撞到哪些问题、具体怎么改造(含代码量与工作量评估)、最终跑出来什么样。</p>
+<p>全部内容来自一套已在真实 AWS(ap-south-1)端到端跑通的实现,数字可溯源到代码与设计文档。</p>
+</blockquote>
+<hr>
+<h2 id="1-aws"><a class="toclink" href="#1-aws">1. 在 AWS 上做推荐系统,缺的是什么</a></h2>
+<p>先说一个容易被忽略的事实:<strong>AWS 没有一个"推荐引擎"产品</strong>。</p>
+<p>AWS 上和推荐沾边的托管能力,要么是<strong>端到端黑盒</strong>,要么是<strong>散装积木</strong>:</p>
+<ul>
+<li><strong>Amazon Personalize</strong> 是端到端托管推荐,你喂数据、它出结果。好处是快;代价是召回/排序逻辑是黑盒,无法定制多路召回的具体策略、无法插自己的重排规则、A/B 也得用它那套。对"已经有算法团队、要白盒可控"的场景不合适。</li>
+<li>其余都是<strong>积木</strong>:SageMaker(训练/推理)、OpenSearch(向量检索)、ElastiCache(KV)、Glue(数据处理)、MSK(事件流)、Athena(分析)。每块都很强,但<strong>它们之间没有"推荐编排层"</strong>。</li>
+</ul>
+<p>而推荐系统真正的复杂度,恰恰就在这个<strong>编排层</strong>:</p>
+<pre class="mermaid">
+flowchart TD
+  A[&quot;多路召回并发&lt;br/&gt;u2i · i2i · 向量 · 热门 · 兜底&quot;] --&gt; B[&quot;结果合并 + 去重 + 打散&quot;]
+  B --&gt; C[&quot;按版本取特征&quot;]
+  C --&gt; D[&quot;拼成模型输入 → 精排打分&quot;]
+  D --&gt; E[&quot;重排&lt;br/&gt;业务置顶 · 多样性 · 强插&quot;]
+  AB[&quot;A/B 分流贯穿全程 + 埋点归因&quot;] -.-&gt; A
+  AB -.-&gt; D
+  AB -.-&gt; E
+</pre>
+<p>这套编排框架——多路召回怎么并发、候选怎么去重打散、特征按什么 key 取、打分协议怎么对接、重排规则怎么插拔、A/B 怎么正交分层——<strong>AWS 不提供,Personalize 把它藏进黑盒,而自己从零写要持续投入很久</strong>。</p>
+<p><strong>所以"在 AWS 上做推荐"缺的不是算力,而是这层编排引擎,以及把引擎和各托管件接起来的适配层。</strong> 这篇文章的主线,就是怎么补上这一层。</p>
+<hr>
+<h2 id="2-aws"><a class="toclink" href="#2-aws">2. 落地 AWS 的三条路线</a></h2>
+<table>
+<thead>
+<tr>
+<th>路线</th>
+<th>做法</th>
+<th>优点</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A. 全托管</strong></td>
+<td>Amazon Personalize</td>
+<td>最快、零运维</td>
+<td>黑盒,召回/排序/A/B 不可定制;迁移已有算法资产困难</td>
+</tr>
+<tr>
+<td><strong>B. 自建引擎</strong></td>
+<td>自己写编排引擎 + 接积木</td>
+<td>完全可控</td>
+<td>编排框架(16+ 召回 / 10+ 过滤 / 9+ 排序 / A/B)要长期投入维护</td>
+</tr>
+<tr>
+<td><strong>C. 开源引擎 + 托管积木</strong></td>
+<td>拿成熟开源编排引擎,只写"接 AWS 的适配层"+ 自己的算法</td>
+<td>编排能力开箱即用、可白盒定制、团队只维护薄适配层</td>
+<td>需要把开源引擎适配到 AWS(本文重点)</td>
+</tr>
+</tbody>
+</table>
+<p>本方案走 <strong>路线 C</strong>:<strong>编排引擎用开源件,把精力投在"接 AWS"和"自己的算法"上</strong>。下面先说为什么是 PaiRec,再说适配怎么做。</p>
+<hr>
+<h2 id="3-pairec"><a class="toclink" href="#3-pairec">3. 为什么选 PaiRec,以及它的工程优点</a></h2>
+<p><a href="https://github.com/alibaba/pairec"><code>alibaba/pairec</code></a> 是阿里云开源的推荐引擎(Go,Apache-2.0)。选它的工程理由:</p>
+<p><strong>3.1 编排能力开箱即用,覆盖面远超起步自研</strong></p>
+<p>PaiRec 内置了推荐编排的全套能力:十多种召回类型、十多种过滤器、近十种排序/重排策略,以及完整的 A/B 实验框架。这意味着"多路召回并发 → 去重打散 → 特征 → 精排 → 重排"这条主链,<strong>配置即可跑通</strong>,不用写编排代码。</p>
+<p><strong>3.2 配置即编排,且与 PAI-Rec 同源</strong></p>
+<p>PaiRec 用一份 JSON 描述"场景 → 召回链 → 过滤链 → 特征 → 排序链",这份配置格式就是阿里云 PAI-Rec 的编排格式。对从阿里云迁移的团队,<strong>配置几乎可平移</strong>;对新团队,改 JSON 就能调编排,不用动代码、不用重新编译。</p>
+<pre><code class="language-json">// pairec.json 片段:一个场景的编排全靠配置描述
+{
+  &quot;SceneName&quot;: &quot;home_feed&quot;,
+  &quot;RecallNames&quot;: [&quot;u2i_custom&quot;, &quot;i2i&quot;, &quot;vec_knn&quot;, &quot;global_hot&quot;],
+  &quot;FilterNames&quot;: [&quot;exposure&quot;, &quot;snake_filter&quot;],
+  &quot;SortNames&quot;: [&quot;algo_score_sort&quot;, &quot;pin_sort&quot;, &quot;category_diversity&quot;]
+}
+</code></pre>
+<p><strong>3.3 提供"注册函数 + Hook"扩展点,不改源码就能扩展</strong></p>
+<p>这是落地 AWS 的关键。PaiRec 暴露了 <code>AddStartHook</code> + 一组 <code>Register*</code>(<code>RegisterRecall</code> / <code>RegisterFilter</code> / <code>RegisterSort</code> / <code>RegistRequestDataFunc</code>),允许你<strong>注册自己的算子实现</strong>而不碰引擎源码。我们所有的 AWS 适配(Redis 召回、OpenSearch 向量、SageMaker 打分适配、HTTP 算法代理),都是通过这个扩展点挂进去的——<strong>PaiRec 源码零修改</strong>。</p>
+<p><strong>3.4 Go 实现,容器化友好</strong></p>
+<p>镜像小、启动快、内存占用低,适合 EKS 上多副本横向扩展。</p>
+<blockquote>
+<p>小结:PaiRec 把"编排"这块最重的活儿用成熟开源件解决了,还留了干净的扩展口子。我们要做的,是给它<strong>接上 AWS 的数据源和推理端,并补上 A/B 分流与离线数据链路</strong>。</p>
+</blockquote>
+<hr>
+<h2 id="4-aws"><a class="toclink" href="#4-aws">4. 落地 AWS 时撞到的真实问题</a></h2>
+<p>把 PaiRec 接到 AWS,有一串"开源默认形态"和"AWS 托管现实"之间的鸿沟需要填:</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>问题</th>
+<th>本质</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P1</td>
+<td>PaiRec 召回/特征默认对接阿里云 Hologres/FeatureStore</td>
+<td>数据源要换成 <strong>ElastiCache Redis / OpenSearch</strong></td>
+</tr>
+<tr>
+<td>P2</td>
+<td>PaiRec 精排默认发 TFServing 协议、<strong>不做 SigV4 签名</strong></td>
+<td><strong>SageMaker Endpoint 强制 SigV4</strong>,协议和鉴权都对不上</td>
+</tr>
+<tr>
+<td>P3</td>
+<td>PaiRec 内置 A/B(PaiABTest)是阿里云专有</td>
+<td>A/B 分流、正交分层、归因要<strong>自建</strong></td>
+</tr>
+<tr>
+<td>P4</td>
+<td>算法工程师用 Python/Java,PaiRec 是 Go</td>
+<td>算法<strong>无法直接嵌入</strong>引擎,需要语言无关的接入方式</td>
+</tr>
+<tr>
+<td>P5</td>
+<td>训练样本特征(离线 Spark)与在线推理特征(在线服务)<strong>两套实现</strong></td>
+<td><strong>训练-服务偏差</strong>:线上效果悄悄打折且难排查</td>
+</tr>
+<tr>
+<td>P6</td>
+<td>离线数据处理早期"Spark 塞进 SageMaker Processing 容器"</td>
+<td>不是大数据生产形态:无数据目录/质量/调度,版本易碎</td>
+</tr>
+<tr>
+<td>P7</td>
+<td>A/B 配置裸存 Redis,改了立刻生效</td>
+<td>控制面<strong>无版本、不可审计、不能回滚</strong>;在线与端侧可能配置漂移</td>
+</tr>
+<tr>
+<td>P8</td>
+<td>推荐不只在云端,端侧(手机)也要做轻量召回/粗排</td>
+<td>配置/特征/向量/模型要<strong>安全下发到不可控的海量设备</strong></td>
+</tr>
+<tr>
+<td>P9</td>
+<td>团队没有专职 K8s 运维,但请求量会增长</td>
+<td>部署要<strong>免运维</strong>且能弹性扩展</td>
+</tr>
+</tbody>
+</table>
+<p>接下来逐个说怎么改。</p>
+<hr>
+<h2 id="5"><a class="toclink" href="#5">5. 适配与改造:具体方案、代码量、工作量评估</a></h2>
+<p>整套改造遵循一条原则:<strong>PaiRec 本体不改,只在外围加适配层和自己的服务</strong>。下面按模块拆开,每节给出方案、关键代码、真实代码量,最后汇总工作量评估。</p>
+<blockquote>
+<p>代码量为本仓库实测行数(含注释与配置;Go/Java/Python 混合)。工作量为按模块复杂度的经验估算(人天),包含开发 + AWS 资源搭建 + 联调,供规划参考。</p>
+</blockquote>
+<h3 id="51-redis-opensearch-p1p3"><a class="toclink" href="#51-redis-opensearch-p1p3">5.1 引擎适配层:Redis 召回 + OpenSearch 向量 + 不改源码扩展(应对 P1、P3 部分)</a></h3>
+<p>PaiRec 的 <code>main.go</code> 实际只有两句"引擎调用"——<code>pairec.AddStartHook(...)</code> 注册扩展,<code>pairec.Run()</code> 启动。所有 AWS 适配都在 hook 里:</p>
+<pre><code class="language-go">pairec.AddStartHook(func() error {
+    algorithm.RegistRequestDataFunc(&quot;rank_model&quot;, tfRequestDataFunc)  // 精排数据适配(见 5.2)
+    recall.RegisterRecall(&quot;country_v0&quot;, NewRedisGroupHotRecall(conf)) // Redis 分组热门召回
+    filter.RegisterFilter(&quot;exposure&quot;, NewExposureFilter(expConf))     // 曝光去重(读 Redis 已曝光集合)
+    sort.RegisterSort(&quot;pin_sort&quot;, NewPinSort(...))                    // 运营置顶(读 rec:pin:&lt;scene&gt;)
+    return nil
+})
+pairec.Run()
+</code></pre>
+<p>配置侧用"合法占位类型 + 标记字段"通过引擎校验,hook 启动时识别标记并用自写实现覆盖注册——<strong>这样既复用引擎的场景/校验机制,又替换了底层数据访问</strong>。</p>
+<p>向量召回单独成一个文件:从用户向量发起 OpenSearch k-NN 查询,走 VPC 内网 + SigV4。</p>
+<p><strong>涉及文件 / 代码量</strong>:
+- <code>pairec-poc/engine/main.go</code>(扩展注册 + 配置加载):<strong>317 行</strong>
+- <code>pairec-poc/engine/http_operators.go</code>(HTTP 代理算子,见 5.4):<strong>258 行</strong>
+- <code>pairec-poc/engine/opensearch_recall.go</code>(OpenSearch k-NN 召回):<strong>320 行</strong>
+- 引擎扩展合计:<strong>约 895 行 Go</strong></p>
+<p><strong>工作量评估</strong>:<strong>3–5 人天</strong>(熟悉 PaiRec 扩展接口后,主要成本在 OpenSearch SigV4 + Redis DAO 调试)。</p>
+<h3 id="52-sagemaker-sigv4-sidecar-p2"><a class="toclink" href="#52-sagemaker-sigv4-sidecar-p2">5.2 SageMaker 精排适配:SigV4 sidecar 代理(应对 P2)</a></h3>
+<p>PaiRec 发 TFServing 风格的 JSON,不带签名;SageMaker Endpoint 要求 SigV4。直接改 PaiRec 的 HTTP 客户端会侵入源码,我们用<strong>同 Pod 的 sidecar 代理</strong>解决:</p>
+<pre class="mermaid">
+flowchart LR
+  P[&quot;PaiRec&quot;] --&gt;|&quot;普通 HTTP · localhost:9000&quot;| S
+  subgraph S [&quot;smproxy（sidecar）&quot;]
+    direction TB
+    S1[&quot;TFServing JSON → SageMaker 调用&quot;] --&gt; S2[&quot;SigV4 签名&quot;]
+  end
+  S --&gt;|&quot;已签名请求&quot;| E[&quot;SageMaker Endpoint&lt;br/&gt;rec-ranker&quot;]
+  E -.-&gt;|&quot;scores[] 回填 item.score&quot;| P
+</pre>
+<p>引擎侧只需把精排地址指向 <code>localhost:9000</code>,<strong>完全不知道下游是 SageMaker</strong>。<code>RegistRequestDataFunc("rank_model", ...)</code> 负责把特征按固定顺序拼成模型输入张量。</p>
+<p><strong>涉及文件 / 代码量</strong>:
+- <code>pairec-poc/proxy/proxy.py</code>(SigV4 + 协议转换):<strong>75 行 Python</strong>
+- 引擎侧 <code>tfRequestDataFunc</code>(在 main.go 内):约 40 行</p>
+<p><strong>工作量评估</strong>:<strong>1–2 人天</strong>(SigV4 + TFServing↔SageMaker 协议对齐)。</p>
+<h3 id="53-ab-ab-router-scene-p3"><a class="toclink" href="#53-ab-ab-router-scene-p3">5.3 A/B 分流服务 ab-router:正交分层 + scene 翻译 + 埋点(应对 P3)</a></h3>
+<p>PaiRec 内置 A/B 是阿里云专有,我们<strong>前置一个独立的分流服务 ab-router</strong>(Java/Spring Boot),把 A/B 的复杂度全收在这里,让 PaiRec 退化为纯执行引擎:</p>
+<p>一次请求在 ab-router 做三件事:
+1. <strong>正交分层分桶</strong>:对每个层(召回层 / 排序层)独立分桶:
+   <code>bucket = murmur3_32(uid + "#" + scene#layer) % 1000</code>(salt = 场景#层名,基数 1000 = 最细 0.1% 流量切;还支持互斥域 Domain 做场景隔离)。同一用户在每层稳定落桶,各层<strong>正交</strong>——可同时参加多个层的实验互不污染。
+2. <strong>scene 翻译</strong>:把"命中哪些实验"翻译成 PaiRec 的 <code>scene_id</code>(如 <code>recall=grouphot &amp; rank=v2</code> → <code>home_feed_v2</code>),再调引擎。
+3. <strong>埋点</strong>:曝光事件带 <code>request_id / exp_id / layer_hits</code> 发 MSK,fire-and-forget 不阻断主路。</p>
+<p><code>exp_id</code> 串成 <code>home_feed#recall:exp_grouphot#rank:exp_v2</code> 随曝光回流,供离线按层归因。</p>
+<p><strong>涉及文件 / 代码量</strong>(只统计 A/B 核心链路;ab-router 整个模块约 4676 行,其中 ~3200 行是演示控制台的 6 角色工作台后端,不计入核心链路):
+- <code>abtest/</code> 包(ABRouter 分桶 356 + Domain/Experiment/Layer/ExpResult):<strong>约 573 行</strong>
+- <code>web/RouterController.java</code>(请求编排 + 埋点):<strong>142 行</strong>
+- <code>web/PaiRecClient.java</code>(scene 翻译 + 调引擎):<strong>106 行</strong>
+- A/B 核心合计:<strong>约 821 行 Java</strong></p>
+<blockquote>
+<p>ab-router 模块里另有两块也计入总账,但归到各自小节:<code>ControlPlaneStore</code>(控制面,见 5.9)、<code>EdgeDistController</code>(端侧分发,见 5.10);三块相加 821+214+430=1465 行,即 ab-router 进核心链路总账的部分。</p>
+</blockquote>
+<p><strong>工作量评估</strong>:<strong>6–8 人天</strong>(分桶算法与离线/端侧逐位对齐、MSK IAM 鉴权埋点、scene 翻译表是主要成本)。</p>
+<h3 id="54-http-p4"><a class="toclink" href="#54-http-p4">5.4 自定义算法服务化:HTTP 代理算子 + 独立算法服务(应对 P4)</a></h3>
+<p>算法工程师不该被 Go 绑住。我们在 PaiRec 侧加一个<strong>通用 HTTP 代理算子</strong>(召回/过滤/排序各一个),按固定契约调外部服务;算法本身写成<strong>独立服务</strong>,语言任意:</p>
+<pre class="mermaid">
+flowchart LR
+  P[&quot;PaiRec（Go）&quot;] --&gt;|&quot;HTTP POST /recall&lt;br/&gt;{uid, scene, size, features}&quot;| R[&quot;recall-svc&lt;br/&gt;（本例 Java / Spring Boot）&quot;]
+  R -.-&gt;|&quot;{items:[{id, score, retrieve_id}]}&quot;| P
+</pre>
+<p>接入只需三步:① 算法服务打镜像部署成 EKS Service;② 引擎设 <code>ALGO_SVC_URL</code> 环境变量(hook 自动注册 <code>http_recall</code>/<code>http_filter</code>/<code>http_sort</code>);③ <code>pairec.json</code> 里把某路召回写成 <code>http_recall</code>。<strong>算法迭代 = 重打算法服务镜像,引擎不动</strong>;换 Python/C++ 也行,遵循契约即可。</p>
+<p><strong>涉及文件 / 代码量</strong>:
+- <code>pairec-poc/engine/http_operators.go</code>(通用代理,已含在 5.1 的 895 行):258 行
+- <code>recall-service/</code>(Java 算法服务模板):<strong>151 行 Java</strong></p>
+<p><strong>工作量评估</strong>:<strong>2–3 人天</strong>(代理算子 + 契约 + 模板服务;之后每个新算法服务按业务复杂度另算)。</p>
+<h3 id="55-spark-udf-p5"><a class="toclink" href="#55-spark-udf-p5">5.5 端云一致:特征算子封装成 Spark UDF(应对 P5)</a></h3>
+<p>训练样本特征(离线)和在线推理特征(在线)如果是两套实现,就会有<strong>训练-服务偏差</strong>——同一个 item 训练看到的 <code>quality_z</code> 和线上不一样,模型上线不涨还查不出原因。</p>
+<p>解法:<strong>特征代码只写一份,两端共用</strong>。把特征生成逻辑封装成 <code>feature-ops</code> 模块(一个 <code>FeatureGenerator</code> + 一份 <code>feature_config.json</code>):</p>
+<ul>
+<li><strong>在线</strong>:online-service 直接调 <code>feature-ops</code> 算特征;</li>
+<li><strong>离线</strong>:把同一个 jar 包成 <strong>Spark UDF</strong>(<code>feature_gen</code>),在 Glue 的样本生成 SQL 里调:</li>
+</ul>
+<pre><code class="language-sql">SELECT feature_gen(request_time, price, quality, ctr) AS f, label
+FROM labeled JOIN item_wide USING(item_id) JOIN user_wide USING(user_id)
+-- f[0..4] = day_h, week_day, price_bucket, quality_z, ctr_z(顺序与在线模型严格对齐)
+</code></pre>
+<p>这样"数据处理用 SQL,特征用同一份 jar",可读性和一致性兼得。</p>
+<p><strong>涉及文件 / 代码量</strong>:
+- <code>feature-ops/</code>(共用特征算子):<strong>300 行 Java</strong>
+- <code>offline-spark/FeatureGenUDF.java</code>(把算子包成 Spark UDF):<strong>86 行 Java</strong></p>
+<p><strong>工作量评估</strong>:<strong>3–4 人天</strong>(关键在 UDF 适配 + 验证两端逐字节一致)。</p>
+<h3 id="56-glue-glue-workflows-p6"><a class="toclink" href="#56-glue-glue-workflows-p6">5.6 离线数据处理迁 Glue + Glue Workflows(应对 P6)</a></h3>
+<p>早期数据处理是 Spark 跑在 SageMaker Processing 容器里——能跑,但要自己打 fat jar、版本易碎、调度靠外挂、没有数据目录/质量这些数据工程能力。按生产标准迁到 <strong>Glue + Glue Workflows</strong>(serverless Spark,最贴 DataWorks 体感):</p>
+<ul>
+<li><strong>算力</strong>:Glue serverless Spark,免管集群;</li>
+<li><strong>编排 + 定时</strong>:Glue Workflow 自带 cron + 依赖触发 + 可视化 DAG(无需外挂 Scheduler);</li>
+<li><strong>数据目录</strong>:Glue Crawler 编目 → Glue Data Catalog(与 Athena 共元数据);</li>
+<li><strong>数据质量</strong>:Glue Data Quality 用 DQDL 规则集做门禁。</li>
+</ul>
+<p>真实 DAG(Workflow <code>rec-offline-glue-workflow</code>,每天 02:00 UTC):</p>
+<pre class="mermaid">
+flowchart TD
+  A[&quot;Crawler 编目 raw&quot;] --&gt; B[&quot;数据加工：清洗 + 宽表 + CTR&lt;br/&gt;+ 分组/全局热门（Spark SQL）&quot;]
+  B --&gt; S[&quot;样本生成&lt;br/&gt;label(SQL) + 特征(feature-ops UDF)&quot;]
+  B --&gt; I[&quot;i2i&lt;br/&gt;ItemCF 共现 + 余弦&quot;]
+  B --&gt; V[&quot;向量&lt;br/&gt;Spark ML ALS&quot;]
+  S --&gt; Q[&quot;质量门禁&lt;br/&gt;Glue Data Quality 规则集&quot;]
+  I --&gt; Q
+  V --&gt; Q
+  Q --&gt;|&quot;不达标&quot;| X[&quot;作业失败&lt;br/&gt;不触发训练&quot;]
+  B -.-&gt;|&quot;并行 fan-out&quot;| V
+  class X fail;
+  classDef fail fill:#fdecea,stroke:#d93025,color:#8a1c12;
+</pre>
+<p>数据处理主体用 <strong>Spark SQL</strong> 表达(可读);i2i 用 ItemCF 共现+余弦(top-50),向量用 Spark ML 的 ALS(隐式反馈矩阵分解,rank=16,比单机 SVD 可扩展)。</p>
+<p><strong>涉及文件 / 代码量</strong>:
+- <code>pipeline/glue/</code>(5 个 Glue 作业:数据加工 106 / 样本 86 / i2i 78 / 向量 72 / 质量门禁 92):<strong>434 行 Python</strong>
+- <code>offline-spark/</code>(DataProcessing + SampleGeneration,旧 Spark 逻辑可复用为参考):409 行(含 5.5 的 UDF)</p>
+<p><strong>工作量评估</strong>:<strong>6–9 人天</strong>(5 个作业改写为 Spark SQL + Glue Data Quality 规则 + Workflow 触发器编排 + 端云一致 UDF 联调)。</p>
+<h3 id="57-sagemaker-p6"><a class="toclink" href="#57-sagemaker-p6">5.7 数据段→模型段衔接 + SageMaker 只做训练注册(应对 P6 延伸)</a></h3>
+<p>数据处理迁 Glue 后,SageMaker Pipeline <strong>只保留训练 + 注册</strong>两步,输入直接吃 Glue 产出的样本:</p>
+<pre class="mermaid">
+flowchart TD
+  G[&quot;Glue 质量门禁 SUCCEEDED&quot;] --&gt;|&quot;EventBridge 规则&quot;| P[&quot;StartPipelineExecution&lt;br/&gt;rec-offline-pipeline&quot;]
+  P --&gt; T[&quot;TrainRanker&lt;br/&gt;SKLearn · 读 s3://.../samples&quot;]
+  T --&gt; R[&quot;RegisterModel → Model Registry&lt;br/&gt;rec-ranker-group · 审批 Approved 才部署&quot;]
+</pre>
+<p>EventBridge 规则匹配 <code>Glue Job State Change = SUCCEEDED</code>(质量门禁作业)→ 触发训练。<strong>两段松耦合、各自可独立重跑</strong>,质量不达标连训练都不会启动。</p>
+<p><strong>涉及文件 / 代码量</strong>:
+- <code>pipeline/build_pipeline.py</code>(训练+注册 Pipeline 定义):<strong>98 行</strong>
+- <code>training/train.py</code> + <code>inference.py</code>:<strong>132 行</strong>
+- EventBridge 规则:配置(非代码)</p>
+<p><strong>工作量评估</strong>:<strong>2–3 人天</strong>。</p>
+<h3 id="58-s3-p6"><a class="toclink" href="#58-s3-p6">5.8 数据面真相源:S3 源 + 幂等上线作业(应对 P6 延伸)</a></h3>
+<p>一条生产原则:<strong>在线存储(Redis/OpenSearch)不是数据的家,只是可重建副本</strong>。</p>
+<pre class="mermaid">
+flowchart LR
+  G[&quot;Glue 产出&quot;] --&gt; S[&quot;S3&lt;br/&gt;Parquet 源 · 持久真相&quot;]
+  S --&gt; Y[&quot;seed_sync&lt;br/&gt;SageMaker Processing · 幂等&quot;]
+  Y --&gt; R[&quot;Redis / OpenSearch&lt;br/&gt;可重建副本&quot;]
+</pre>
+<p>特征/向量/召回先落 <code>s3://&lt;data&gt;/seed/</code> 的列式 Parquet;上线作业读 S3 写 <code>rec:feat:item:vN:*</code> / <code>rec:u2i:*</code> / <code>rec:grouphot:*</code>(Redis)和 item-vectors k-NN 索引(OpenSearch)。<strong>Redis 挂了、索引坏了,重跑一次就从 S3 恢复,不丢数据</strong>;S3 路径 <code>seed/item_features/vN/</code> + Redis key 前缀 <code>rec:feat:item:vN:</code> 天然支持特征版本 A/B。</p>
+<p><strong>涉及文件 / 代码量</strong>:
+- <code>pipeline/featuresync_src/seed_sync.py</code>(幂等上线作业):<strong>186 行 Python</strong></p>
+<p><strong>工作量评估</strong>:<strong>2–3 人天</strong>。</p>
+<h3 id="59-rds-p7"><a class="toclink" href="#59-rds-p7">5.9 控制面 RDS 统一发布(应对 P7)</a></h3>
+<p>A/B 配置这类控制面数据裸存 Redis 不安全(无版本、不可回滚)。迁到 <strong>RDS PostgreSQL</strong> + 统一发布流程:</p>
+<p>三张表——<code>ab_config_draft</code>(草稿,可改不生效)、<code>published_version</code>(已发布版本,不可变,带 SHA256)、<code>published_pointer</code>(当前版本指针)。<strong>改配置 = 改草稿 → 发布成版本 → 在线 ab-router 与端侧手机都消费"当前已发布版本"</strong>;<strong>回滚 = 切指针</strong>(秒级),在线和端侧同时回退。Redis 退化为已发布版本的热缓存,ab-router 每 30s 或发布后立即从 RDS 重读。</p>
+<p><strong>涉及文件 / 代码量</strong>:
+- <code>ab-router/.../control/ControlPlaneStore.java</code>(三表 + 发布/回滚/版本):<strong>214 行 Java</strong></p>
+<p><strong>工作量评估</strong>:<strong>3–4 人天</strong>。</p>
+<h3 id="510-s3-cloudfront-url-p8"><a class="toclink" href="#510-s3-cloudfront-url-p8">5.10 端侧分发:S3 + CloudFront 签名 URL + 增量包(应对 P8)</a></h3>
+<p>端侧(手机)要做轻量召回/粗排,需安全下发四类制品:<strong>A/B 配置、特征、向量、端侧模型</strong>。面向千万级不可控设备:</p>
+<ul>
+<li><strong>存储</strong>:制品版本化存 S3(<code>edge/&lt;kind&gt;/&lt;kind&gt;-vN.json</code>),元数据(版本/SHA256/大小)进 RDS;</li>
+<li><strong>分发</strong>:CloudFront(边缘缓存抗大基数)+ <strong>签名 URL</strong>(TrustedKeyGroup,绑路径 + 10 分钟过期);</li>
+<li><strong>增量</strong>:特征/向量产增量包(相对上一版的 changed/removed),手机差一版时只下增量,省带宽;</li>
+<li><strong>校验</strong>:每包带 SHA256,端侧重算比对,不过用本地旧版(绝不开天窗),下临时文件 → 校验过 → 原子 rename;</li>
+<li><strong>端云分桶一致</strong>:端侧 SDK 复刻同一份 <code>murmur3_32 % 1000</code> + 同 salt,实测 <code>u0000123</code> 端云都落桶 187、<code>u9999999</code> 都落 379。</li>
+</ul>
+<p><strong>防盗链实测</strong>(三层防护):S3 完全私有(仅 CloudFront OAC 可读)+ 强制签名 URL + 10 分钟过期。攻击实测:直连 S3→403;无签名→403 MissingKey(签名校验在缓存命中之前);篡改路径/Expires/Signature→全 403;合法签名 10 分钟内→200。</p>
+<p><strong>涉及文件 / 代码量</strong>:
+- <code>ab-router/.../web/EdgeDistController.java</code>(发布/清单/增量/签名/回滚/分桶):<strong>430 行 Java</strong></p>
+<p><strong>工作量评估</strong>:<strong>5–7 人天</strong>(CloudFront OAC + 签名密钥 + 增量包 diff + 端云分桶对齐 + 防盗链验证)。</p>
+<h3 id="511-eks-auto-mode-targetgroupbinding-p9"><a class="toclink" href="#511-eks-auto-mode-targetgroupbinding-p9">5.11 部署:EKS Auto Mode + TargetGroupBinding(应对 P9)</a></h3>
+<p>在线跑在 <strong>EKS Auto Mode</strong>(集群 <code>rec-eks</code> / 命名空间 <code>rec</code>)。选它的理由很实在:<strong>团队没有专职 K8s 运维,而请求量会增长</strong>——Auto Mode 全自动管节点(扩缩/打补丁/替换/bin-packing)+ 托管周边组件。用户只需两步:① 控制台「镜像构建」触发 CodeBuild 推 ECR;② 「EKS 发布」选服务填镜像 tag 滚动更新。其余(调度/节点/扩缩/服务发现/健康检查)全交给 Auto Mode。</p>
+<p>两个部署细节:
+- <strong>服务发现</strong>回归 K8s 内置 DNS(<code>pairec.rec.svc.cluster.local</code>),不需 Cloud Map;
+- <strong>入口稳定</strong>用 <code>TargetGroupBinding</code> 而非 Ingress:ALB 由 AWS 控制台独立管(外网 IP 不变、白名单不失效),controller 只把 ab-router 的 Pod IP 同步进现有 target group。</p>
+<p><strong>涉及内容 / 工作量</strong>:eksctl 集群配置 + K8s manifests + TargetGroupBinding + IRSA,<strong>约 4–6 人天</strong>(主要在 IRSA 权限调试与 ALB 解耦)。</p>
+<h3 id="512"><a class="toclink" href="#512">5.12 改造总账:代码量与工作量汇总</a></h3>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>主要文件</th>
+<th style="text-align: right;">代码量(行)</th>
+<th style="text-align: right;">估算工作量(人天)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>引擎适配(Redis 召回 / OpenSearch / 扩展注册)</td>
+<td><code>pairec-poc/engine/*.go</code></td>
+<td style="text-align: right;">~895(Go)</td>
+<td style="text-align: right;">3–5</td>
+</tr>
+<tr>
+<td>SageMaker SigV4 代理</td>
+<td><code>pairec-poc/proxy/proxy.py</code></td>
+<td style="text-align: right;">75(Py)</td>
+<td style="text-align: right;">1–2</td>
+</tr>
+<tr>
+<td>A/B 分流服务核心</td>
+<td><code>ab-router/abtest/*</code>、Router/PaiRecClient</td>
+<td style="text-align: right;">~821(Java)</td>
+<td style="text-align: right;">6–8</td>
+</tr>
+<tr>
+<td>算法服务化(代理 + 模板)</td>
+<td><code>http_operators.go</code>、<code>recall-service/</code></td>
+<td style="text-align: right;">151(Java)+ 代理已计</td>
+<td style="text-align: right;">2–3</td>
+</tr>
+<tr>
+<td>端云一致特征(算子 + UDF)</td>
+<td><code>feature-ops/</code>、<code>FeatureGenUDF.java</code></td>
+<td style="text-align: right;">386(Java)</td>
+<td style="text-align: right;">3–4</td>
+</tr>
+<tr>
+<td>离线 Glue 数据处理</td>
+<td><code>pipeline/glue/*.py</code></td>
+<td style="text-align: right;">434(Py)</td>
+<td style="text-align: right;">6–9</td>
+</tr>
+<tr>
+<td>模型 Pipeline + 训练</td>
+<td><code>build_pipeline.py</code>、<code>training/*</code></td>
+<td style="text-align: right;">230(Py)</td>
+<td style="text-align: right;">2–3</td>
+</tr>
+<tr>
+<td>数据面上线作业</td>
+<td><code>seed_sync.py</code></td>
+<td style="text-align: right;">186(Py)</td>
+<td style="text-align: right;">2–3</td>
+</tr>
+<tr>
+<td>控制面 RDS 统一发布</td>
+<td><code>ControlPlaneStore.java</code></td>
+<td style="text-align: right;">214(Java)</td>
+<td style="text-align: right;">3–4</td>
+</tr>
+<tr>
+<td>端侧分发</td>
+<td><code>EdgeDistController.java</code></td>
+<td style="text-align: right;">430(Java)</td>
+<td style="text-align: right;">5–7</td>
+</tr>
+<tr>
+<td>EKS 部署</td>
+<td>eksctl / k8s / TGB / IRSA</td>
+<td style="text-align: right;">配置为主</td>
+<td style="text-align: right;">4–6</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td></td>
+<td style="text-align: right;"><strong>约 3800 行手写代码</strong>(Go/Java/Python 混合)+ 配置</td>
+<td style="text-align: right;"><strong>约 37–54 人天</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>口径说明(避免重复计数):
+- <code>http_operators.go</code>(258 行)已计入引擎适配的 895 行,故"算法服务化"一行只另计 recall-service 模板的 151 行;
+- ab-router 整个模块约 4676 行,只有 <strong>1465 行</strong>进核心链路总账(A/B 核心 821 + 控制面 ControlPlaneStore 214 + 端侧 EdgeDistController 430),其余 <strong>~3200 行是演示控制台 6 角色工作台的后端</strong>(DemoController / TopologyController / WorkspaceController / PipelineController / GlueController 等),属演示辅助、不计入核心链路;前端 <code>static/index.html</code>(单文件展示页)同样不计。</p>
+<p>这里的代码量是<strong>核心链路的适配层 + 自有服务</strong>——不含 PaiRec 引擎本体(开源件,零修改),也不含演示控制台。也就是说,<strong>核心链路约 3800 行适配代码 + 一个开源编排引擎,就换来一套白盒可控、跑在 AWS 托管栈上的完整推荐系统</strong>。工作量约 1.5–2.5 人月(单人),含 AWS 资源搭建与联调;若团队并行可压缩。这是把"造引擎"省下来的成本,投到了"接 AWS + 自己的算法"上。</p>
+</blockquote>
+<hr>
+<h2 id="6"><a class="toclink" href="#6">6. 最终产品、架构与测试效果</a></h2>
+<h3 id="61"><a class="toclink" href="#61">6.1 最终架构</a></h3>
+<pre class="mermaid">
+flowchart TB
+  Client[&quot;客户端&quot;] --&gt; ALB[&quot;ALB（IP 白名单）&quot;]
+  subgraph Online [&quot;在线推理 · EKS Auto Mode（rec-eks/rec）&quot;]
+    direction TB
+    ALB --&gt; AR[&quot;ab-router&lt;br/&gt;分流 / 翻译 / 埋点&lt;br/&gt;正交分层 murmur3%1000 · scene 翻译&quot;]
+    AR --&gt; PR[&quot;PaiRec&lt;br/&gt;召回 → 过滤 → 特征 → 精排 → 重排&quot;]
+    PR --&gt; RDS_C[&quot;ElastiCache Redis&lt;br/&gt;特征 / 召回 / 热门&quot;]
+    PR --&gt; OS[&quot;OpenSearch&lt;br/&gt;向量 k-NN&quot;]
+    PR --&gt; SM[&quot;smproxy → SageMaker Endpoint&lt;br/&gt;精排&quot;]
+    PR --&gt; RC[&quot;recall-svc&lt;br/&gt;Java 算法 · HTTP 代理&quot;]
+  end
+  AR --&gt;|&quot;埋点 expose/click/convert&quot;| MSK[&quot;MSK → Firehose → S3&quot;]
+  MSK --&gt; ATH[&quot;Athena&lt;br/&gt;按 layer/variant 算 CTR/CVR + z-test&quot;]
+  subgraph Offline [&quot;离线数据处理 · Glue + Glue Workflows（serverless Spark · cron）&quot;]
+    direction LR
+    RAW[&quot;S3 / raw&quot;] --&gt; CAT[&quot;编目&quot;] --&gt; CLEAN[&quot;清洗 + CTR + 热门（SQL）&quot;]
+    CLEAN --&gt; SAMP[&quot;样本(SQL+UDF) ‖ i2i ‖ 向量(ALS)&quot;] --&gt; DQ[&quot;质量门禁（Glue DQ）&quot;]
+  end
+  subgraph Model [&quot;离线模型 · SageMaker Pipeline&quot;]
+    direction LR
+    TR[&quot;TrainRanker&quot;] --&gt; RG[&quot;RegisterModel&quot;] --&gt; MR[&quot;Model Registry&lt;br/&gt;审批后部署 Endpoint&quot;]
+  end
+  DQ --&gt;|&quot;EventBridge（门禁 SUCCEEDED）&quot;| TR
+  MR -.-&gt;|&quot;部署&quot;| SM
+  CP[&quot;控制面：RDS PostgreSQL&lt;br/&gt;草稿 / 已发布版本 / 指针&quot;] -.-&gt;|&quot;同源消费『已发布版本』&quot;| AR
+  CP -.-&gt; EDGE[&quot;端侧：S3 版本化制品 + CloudFront 签名 URL&lt;br/&gt;+ SHA256 + 增量包（A/B配置/特征/向量/端侧模型）&quot;]
+  DATA[&quot;数据面：S3（Parquet 源 · 真相）&quot;] --&gt;|&quot;seed_sync 幂等上线&quot;| RDS_C
+  DATA --&gt; OS
+</pre>
+<h3 id="62"><a class="toclink" href="#62">6.2 最终产品形态</a></h3>
+<p>四块全部跑通,并通过一个 <strong>6 角色演示控制台</strong>呈现(👤用户 / 🧪算法 / 🏛️架构 / 📊数据 / 🛠️运维 / 💼管理):控制台架构图上的每个模块都<strong>绑定真实 AWS 组件 / Glue 作业 / SageMaker 步骤</strong>,实读控制面 API 渲染——按真实状态着色、点开看脚本/输入输出/延时/健康,<strong>所见即真实在跑的系统</strong>(故障注入时对应模块实时变红)。</p>
+<h3 id="63"><a class="toclink" href="#63">6.3 测试效果</a></h3>
+<p>测试分两方面:<strong>功能</strong>——支持哪些推荐系统能力(均为真实 AWS 实测);<strong>性能</strong>——在线链路的实测延时与吞吐。</p>
+<h4 id="631"><a class="toclink" href="#631">6.3.1 功能:支持的推荐系统能力(真实实测)</a></h4>
+<p><strong>召回(多路并行)</strong>——以下召回类型均实测命中对应数据:</p>
+<table>
+<thead>
+<tr>
+<th>召回</th>
+<th>实现</th>
+<th>数据源</th>
+<th>实测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>u2i 个性化</td>
+<td>UserCustomRecall</td>
+<td>Redis <code>rec:u2i:&lt;uid&gt;</code></td>
+<td>返回该用户历史相关 item</td>
+</tr>
+<tr>
+<td>i2i 协同过滤</td>
+<td>ItemCF(离线 Glue 算)</td>
+<td>Redis <code>rec:i2i:</code></td>
+<td>按最后点击 item 出簇内同伴</td>
+</tr>
+<tr>
+<td>向量召回</td>
+<td>OpenSearch k-NN</td>
+<td>OpenSearch 向量索引</td>
+<td>同兴趣簇内近邻(SigV4 VPC 内网)</td>
+</tr>
+<tr>
+<td>分组热门</td>
+<td>自写 Redis 召回</td>
+<td><code>rec:grouphot:country:&lt;C&gt;</code></td>
+<td>用户特征(国家)驱动分组 key</td>
+</tr>
+<tr>
+<td>全局热门兜底</td>
+<td>无 Trigger 召回</td>
+<td><code>rec:globalhot:all</code></td>
+<td>冷启动用户(无 u2i)正常出结果</td>
+</tr>
+</tbody>
+</table>
+<p><strong>过滤 / 排序 / 重排</strong>——均实测生效:
+- <strong>过滤</strong>:曝光去重(读 Redis 已曝光集合,已曝光 item 被滤掉)、SnakeFilter 多路蛇形打散;
+- <strong>精排</strong>:特征 → smproxy SigV4 → SageMaker Endpoint 打分,结果<strong>按模型分重排</strong>(打分最高的 item 冲到第 1);
+- <strong>重排</strong>:运营置顶(PinSort 把垫底 item 提到最前)、多样性打散(同类目交错);
+- <strong>在线派生特征</strong>:<code>day_h</code>(请求时实时算的小时)等上下文特征在请求时现算。</p>
+<p><strong>特征版本化 A/B</strong>:<code>home_feed</code>(特征 v1)vs <code>home_feed_v2</code>(特征 v2)对同一用户<strong>产出不同排序</strong>——验证特征按版本隔离、A/B 可切版本。</p>
+<p><strong>A/B 正交分层 + 归因闭环</strong>(合成数据注入已知效应,验证归因链路能检出):
+- 召回层、排序层正交分桶,<code>exp_id</code> 形如 <code>home_feed#recall:exp_grouphot#rank:exp_v2</code>;
+- 埋点 expose/click/convert 经 MSK→Firehose→S3→Athena 落库,按 layer/variant 聚合 + 双比例 z-test;
+- 实测:分组热门组 CTR 显著高于对照组(z≈2.12,95% 显著),CVR 同向(16.7% vs 9.1%)——<strong>分流 → 归因 → 显著性的飞轮闭环可用</strong>。</p>
+<p><strong>离线 + 飞轮</strong>:
+- Glue Workflow <code>rec-offline-glue-workflow</code> <strong>6 个动作全部 SUCCEEDED</strong>(编目→数据加工→样本/i2i/向量并行→质量门禁);
+- 端云一致 UDF 在 Glue 中验证产出特征列 <code>day_h/week_day/price_bucket/quality_z/ctr_z/label</code>;
+- 质量门禁通过 → EventBridge 触发 → SageMaker Pipeline 新执行 <strong>Succeeded</strong>。</p>
+<p><strong>容错降级</strong>:注入 Redis 故障 → 自动走全局热门兜底,<strong>不开天窗</strong>;端侧下载校验失败 → 用本地旧版。</p>
+<h4 id="632"><a class="toclink" href="#632">6.3.2 性能:在线链路实测延时与吞吐</a></h4>
+<p>用内置压测端点 <code>/admin/demo/benchmark</code> 在 <strong>EKS 上对全链路并发施压</strong>(ab-router 进程内 → 分流 → PaiRec → Redis 多路召回 + OpenSearch + SageMaker 精排,<strong>含各数据源真实网络往返</strong>;测的是服务端处理,不含公网 RTT),实测:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">并发</th>
+<th style="text-align: right;">请求数</th>
+<th style="text-align: right;">成功率</th>
+<th style="text-align: right;">QPS</th>
+<th style="text-align: right;">P50</th>
+<th style="text-align: right;">P90</th>
+<th style="text-align: right;">P99</th>
+<th style="text-align: right;">Max</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">2000</td>
+<td style="text-align: right;">100%</td>
+<td style="text-align: right;">360</td>
+<td style="text-align: right;">29ms</td>
+<td style="text-align: right;">167ms</td>
+<td style="text-align: right;">237ms</td>
+<td style="text-align: right;">553ms</td>
+</tr>
+<tr>
+<td style="text-align: right;">50</td>
+<td style="text-align: right;">3000</td>
+<td style="text-align: right;">100%</td>
+<td style="text-align: right;">579</td>
+<td style="text-align: right;">49ms</td>
+<td style="text-align: right;">212ms</td>
+<td style="text-align: right;">240ms</td>
+<td style="text-align: right;">346ms</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>成功率 100%</strong>,无失败请求;</li>
+<li>并发从 20 提到 50,QPS 从 360 升到 579(单 Pod、未横向扩),P99 稳定在 ~240ms;</li>
+<li>这是<strong>单副本</strong>的数字——EKS Auto Mode 下横向加副本即可线性提吞吐。</li>
+</ul>
+<p><strong>分阶段耗时与瓶颈定位</strong>(典型量级,用于找优化重点):</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>组件</th>
+<th style="text-align: right;">P50</th>
+<th style="text-align: right;">P99</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分流</td>
+<td>ab-router 一致性哈希</td>
+<td style="text-align: right;">1ms</td>
+<td style="text-align: right;">2ms</td>
+</tr>
+<tr>
+<td>召回</td>
+<td>Redis 多路 + OpenSearch k-NN</td>
+<td style="text-align: right;">8ms</td>
+<td style="text-align: right;">18ms</td>
+</tr>
+<tr>
+<td>过滤</td>
+<td>曝光去重 / SnakeFilter</td>
+<td style="text-align: right;">2ms</td>
+<td style="text-align: right;">5ms</td>
+</tr>
+<tr>
+<td>特征</td>
+<td>Redis 批量取 + 在线派生</td>
+<td style="text-align: right;">6ms</td>
+<td style="text-align: right;">14ms</td>
+</tr>
+<tr>
+<td><strong>精排</strong></td>
+<td><strong>SageMaker Endpoint 打分</strong></td>
+<td style="text-align: right;"><strong>28ms</strong></td>
+<td style="text-align: right;"><strong>95ms</strong></td>
+</tr>
+<tr>
+<td>重排</td>
+<td>多样性打散 / 运营置顶</td>
+<td style="text-align: right;">3ms</td>
+<td style="text-align: right;">8ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>瓶颈是精排</strong>(SageMaker 远程打分,占整链路约 60% 耗时)——这也符合推荐系统的普遍规律:延时大头在模型计算与特征/打分的网络往返,与编排框架本身无关。对应的优化方向很清晰:模型蒸馏 / 批处理打分 / 打分结果缓存 / 把轻量模型进程内推理(省一次网络往返)。</p>
+<blockquote>
+<p>测试条件说明:压测在 ap-south-1 真实 EKS 环境、单 ab-router 副本、<code>home_feed</code> 场景、随机 uid(覆盖冷热用户)下进行;数据为注入已知 A/B 效应的合成数据,目的是验证<strong>工程链路的吞吐/延时/正确性/可归因性</strong>,而非真实业务增益。接真实流量后,同一套链路与压测方法即可产出生产基线。</p>
+</blockquote>
+<p><strong>端侧</strong>:
+- 四类制品经 CloudFront 签名 URL 下载 HTTP 200 + SHA256 校验一致;增量包正确合并;
+- 防盗链:无签名/篡改路径/篡改 Expires/篡改 Signature <strong>全部 403</strong>;
+- 端云分桶逐位一致(187/379 实测对齐)。</p>
+<blockquote>
+<p>说明:测试用的是结构化<strong>合成数据</strong>(注入了已知 A/B 效应),目的是验证<strong>工程链路的正确性与可归因性</strong>,不是真实业务增益;接真实流量后,同一套链路即可产出真实指标。</p>
+</blockquote>
+<hr>
+<h2 id="7"><a class="toclink" href="#7">7. 几个可复用的工程判断</a></h2>
+<ol>
+<li><strong>AWS 上做推荐,先补"编排层"</strong>——算力是积木,编排才是缺口;用成熟开源引擎 + 扩展点接 AWS,比从零造或用黑盒都更可控。</li>
+<li><strong>适配层别侵入引擎</strong>——<code>AddStartHook + Register*</code> + sidecar 代理,让引擎源码零改动,升级开源版本无痛。</li>
+<li><strong>算法服务化、语言无关</strong>——引擎只编排,算法独立成 HTTP 服务,谁的语言都能接、能独立扩缩热更。</li>
+<li><strong>端云一致用同一份特征代码</strong>——离线把在线的特征 jar 包成 Spark UDF,从根上消除训练-服务偏差。</li>
+<li><strong>数据真相在对象存储,在线存储是可重建副本</strong>——挂了能重跑恢复。</li>
+<li><strong>控制面版本化 + 统一发布</strong>——草稿/版本/指针,在线与端侧同源、秒级回滚。</li>
+<li><strong>数据用 Glue、模型用 SageMaker、EventBridge 衔接</strong>——各用所长,数据段自带 cron 与质量门禁。</li>
+<li><strong>没有运维就上 EKS Auto Mode + TargetGroupBinding</strong>——用户只管镜像版本,入口与节点都交给托管。</li>
+</ol>
+<hr>
+<h3 id="aws"><a class="toclink" href="#aws">附:涉及的 AWS 组件</a></h3>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>AWS 服务</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>容器编排</td>
+<td>EKS Auto Mode</td>
+<td>跑 ab-router / PaiRec(+smproxy)/ recall-svc,免运维节点</td>
+</tr>
+<tr>
+<td>入口</td>
+<td>ALB + TargetGroupBinding</td>
+<td>IP 白名单;ALB 独立管,Pod 自动同步</td>
+</tr>
+<tr>
+<td>在线特征/召回</td>
+<td>ElastiCache Redis</td>
+<td>特征 vN / u2i / 热门 / 曝光 / 已发布配置热缓存</td>
+</tr>
+<tr>
+<td>向量召回</td>
+<td>OpenSearch k-NN</td>
+<td>物品向量近邻检索(VPC 内 SigV4)</td>
+</tr>
+<tr>
+<td>精排推理</td>
+<td>SageMaker Endpoint</td>
+<td>排序模型在线打分</td>
+</tr>
+<tr>
+<td>离线数据处理</td>
+<td>Glue + Glue Workflows</td>
+<td>编目/清洗/样本/i2i/向量/质量门禁,serverless Spark + cron</td>
+</tr>
+<tr>
+<td>数据目录/质量</td>
+<td>Glue Data Catalog / Data Quality</td>
+<td>编目元数据;DQDL 质量门禁</td>
+</tr>
+<tr>
+<td>模型训练/注册</td>
+<td>SageMaker Pipeline + Model Registry</td>
+<td>训练 + 注册(EventBridge 接 Glue 门禁触发)</td>
+</tr>
+<tr>
+<td>段间衔接</td>
+<td>EventBridge</td>
+<td>Glue 质量门禁 SUCCEEDED → 触发训练</td>
+</tr>
+<tr>
+<td>数据真相源</td>
+<td>S3</td>
+<td>Parquet 源 / 埋点回流 / 端侧制品 / 配置</td>
+</tr>
+<tr>
+<td>埋点回流</td>
+<td>MSK → Firehose</td>
+<td>曝光/点击/转化事件落数据湖</td>
+</tr>
+<tr>
+<td>指标归因</td>
+<td>Athena</td>
+<td>按 layer/variant 算 CTR/CVR + z-test</td>
+</tr>
+<tr>
+<td>控制面真相源</td>
+<td>RDS PostgreSQL</td>
+<td>A/B 配置草稿 + 已发布版本 + 指针</td>
+</tr>
+<tr>
+<td>端侧分发</td>
+<td>CloudFront(签名 URL)+ S3</td>
+<td>四类制品版本化下发,防盗链</td>
+</tr>
+<tr>
+<td>权限</td>
+<td>IAM IRSA</td>
+<td>ServiceAccount 绑角色,无密钥</td>
+</tr>
+<tr>
+<td>可观测</td>
+<td>CloudWatch</td>
+<td>日志 / 指标 / 告警</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>部署区域 ap-south-1;在线/离线/A/B/端侧四块均已在真实 AWS 端到端跑通。本文所有数字来自项目源码与内部设计文档。</p>
+</blockquote>
+    </article>
+    <footer class="site-footer">
+      <p><a href="../index.html">← 返回 Wdd&#x27;s Blog 文章列表</a></p>
+      <p>© Wdd&#x27;s Blog · 本页由 <code>build.py</code> 从 Markdown 静态渲染。</p>
+    </footer>
+  </main>
+
+  <aside class="toc-sidebar" id="toc" aria-label="文章大纲">
+    <div class="toc-sidebar__inner">
+      <p class="toc-sidebar__title">大纲</p>
+      <nav class="toc-nav">
+        <ul>
+<li><a href="#1-aws">1. 在 AWS 上做推荐系统,缺的是什么</a></li>
+<li><a href="#2-aws">2. 落地 AWS 的三条路线</a></li>
+<li><a href="#3-pairec">3. 为什么选 PaiRec,以及它的工程优点</a></li>
+<li><a href="#4-aws">4. 落地 AWS 时撞到的真实问题</a></li>
+<li><a href="#5">5. 适配与改造:具体方案、代码量、工作量评估</a><ul>
+<li><a href="#51-redis-opensearch-p1p3">5.1 引擎适配层:Redis 召回 + OpenSearch 向量 + 不改源码扩展(应对 P1、P3 部分)</a></li>
+<li><a href="#52-sagemaker-sigv4-sidecar-p2">5.2 SageMaker 精排适配:SigV4 sidecar 代理(应对 P2)</a></li>
+<li><a href="#53-ab-ab-router-scene-p3">5.3 A/B 分流服务 ab-router:正交分层 + scene 翻译 + 埋点(应对 P3)</a></li>
+<li><a href="#54-http-p4">5.4 自定义算法服务化:HTTP 代理算子 + 独立算法服务(应对 P4)</a></li>
+<li><a href="#55-spark-udf-p5">5.5 端云一致:特征算子封装成 Spark UDF(应对 P5)</a></li>
+<li><a href="#56-glue-glue-workflows-p6">5.6 离线数据处理迁 Glue + Glue Workflows(应对 P6)</a></li>
+<li><a href="#57-sagemaker-p6">5.7 数据段→模型段衔接 + SageMaker 只做训练注册(应对 P6 延伸)</a></li>
+<li><a href="#58-s3-p6">5.8 数据面真相源:S3 源 + 幂等上线作业(应对 P6 延伸)</a></li>
+<li><a href="#59-rds-p7">5.9 控制面 RDS 统一发布(应对 P7)</a></li>
+<li><a href="#510-s3-cloudfront-url-p8">5.10 端侧分发:S3 + CloudFront 签名 URL + 增量包(应对 P8)</a></li>
+<li><a href="#511-eks-auto-mode-targetgroupbinding-p9">5.11 部署:EKS Auto Mode + TargetGroupBinding(应对 P9)</a></li>
+<li><a href="#512">5.12 改造总账:代码量与工作量汇总</a></li>
+</ul>
+</li>
+<li><a href="#6">6. 最终产品、架构与测试效果</a><ul>
+<li><a href="#61">6.1 最终架构</a></li>
+<li><a href="#62">6.2 最终产品形态</a></li>
+<li><a href="#63">6.3 测试效果</a></li>
+</ul>
+</li>
+<li><a href="#7">7. 几个可复用的工程判断</a><ul>
+<li><a href="#aws">附:涉及的 AWS 组件</a></li>
+</ul>
+</li>
+</ul>
+      </nav>
+    </div>
+  </aside>
+</div>
+
+<div class="toc-backdrop" id="toc-backdrop" hidden></div>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  const dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  mermaid.initialize({
+    startOnLoad: true,
+    securityLevel: "strict",
+    theme: dark ? "dark" : "neutral",
+    flowchart: { useMaxWidth: true, htmlLabels: true, curve: "basis" },
+    themeVariables: { fontFamily: "inherit", fontSize: "14px" }
+  });
+</script>
+<script src="../assets/toc.js" defer></script>
+</body>
+</html>

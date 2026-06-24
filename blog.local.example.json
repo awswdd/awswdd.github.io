@@ -1,0 +1,9 @@
+{
+  "_comment": "复制为 blog.local.json 并填入真实值；该文件不会提交（见 .gitignore）。也可改用环境变量 BLOG_SRC_DIR + BLOG_SOURCES（逗号分隔）。",
+  "src_dir": "/path/to/private/blog/source/dir",
+  "sources": [
+    "NN-some-title-rewrite.md",
+    "NN-another-title-public.md",
+    {"path": "/abs/path/to/another/repo/docs/blog/some-post.md"}
+  ]
+}

@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="这篇写的是一个很具体的问题：当 AI agent 开始参与真实代码库开发时，文档不再只是给人看的说明书。它会进入 agent 的决策链路，变成一种会影响代码产出的依赖。">
+<title>文档即可靠依赖：我在项目里用事件溯源管理文档 · Wdd&#x27;s Blog</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#content">跳到正文</a>
+
+<header class="site-header">
+  <div class="site-header__inner">
+    <a class="site-brand" href="../index.html">Wdd&#x27;s Blog</a>
+    <button id="toc-toggle" class="toc-toggle" aria-expanded="false" aria-controls="toc">
+      <span class="toc-toggle__icon" aria-hidden="true"></span>
+      <span class="toc-toggle__label">目录</span>
+    </button>
+  </div>
+  <div class="reading-progress" id="reading-progress"></div>
+</header>
+
+<div class="layout">
+  <main class="content" id="content">
+    <article class="article">
+      <header class="article__hero">
+        <a class="article__back" href="../index.html">← 返回文章列表</a>
+        <p class="article__eyebrow">工程笔记</p>
+        <h1 class="article__title">文档即可靠依赖：我在项目里用事件溯源管理文档</h1>
+        <p class="article__byline">内容创作：wdd · 美化编辑：codex (gpt-5.5) · 审核：wdd</p>
+        <p class="article__meta">约 4713 字 · 阅读约 13 分钟</p>
+      </header>
+      <blockquote>
+<p>这篇写的是一个很具体的问题：当 AI agent 开始参与真实代码库开发时，文档不再只是给人看的说明书。它会进入 agent 的决策链路，变成一种会影响代码产出的依赖。</p>
+</blockquote>
+<h2 id="_2"><a class="toclink" href="#_2">为什么文档会变成工程依赖</a></h2>
+<p>过去我对项目文档的要求很简单：人能看懂，改代码时别被误导，就已经不错了。但把 coding agent 放进真实代码库之后，这个要求不够了。文档不再只是背景材料，它会被放进上下文，参与 agent 对系统边界、调用路径和设计意图的判断。</p>
+<p>这不是纯粹的个人感受。arXiv 上有一篇《Codified Context: Infrastructure for AI Agents in a Complex Codebase》，它是一篇单开发者、单项目的 experience report。作者把项目文档分成 hot memory、specialized agents、cold memory 三层，用来让 agent 在跨 session 开发中保持一致性。它在维护成本一节里写到：</p>
+<blockquote>
+<p>Specification staleness was the primary failure mode.</p>
+</blockquote>
+<p>作者后面解释得更具体：当子系统实现已经变化，而 specification 没有同步更新时，agent 会基于旧信息生成看起来语法正确、但和近期重构冲突的代码；这些错误需要人手工诊断，通常到测试阶段才暴露。</p>
+<p>这篇文章不能证明“所有项目里文档陈旧都是第一失败模式”。它只是一个项目里的经验。但它能支撑一个更稳妥的判断：<strong>对依赖项目文档工作的 coding agent 来说，过期文档是实实在在的故障来源。</strong></p>
+<p>另一篇《When LLMs Lag Behind: Knowledge Conflicts from Evolving APIs in Code Generation》从 API 演化角度给了相近的提醒。研究者收集了 8 个 Python 库的 270 个真实 API 更新，评估 11 个模型后发现，只给 update description 时，可执行率平均只有 42.55%；加入结构化 API 文档后，可执行率提高到 66.36%，但仍然不算高。</p>
+<p>这组数字的意思不是“文档没用”。恰恰相反，文档是最大增益来源之一。但它也说明另一件事：<strong>给了正确文档，不等于模型一定会按文档做</strong>。文档要先正确、清晰、边界明确，才谈得上让 agent 使用它。</p>
+<p>把这两点放在一起，我得到的不是一个夸张结论，而是一个很工程化的提醒：</p>
+<p><strong>agent 需要文档，但不能把文档当成随手维护的附属物。文档如果要进入 agent 的上下文，就必须像代码依赖一样有边界、有版本、有变更记录。</strong></p>
+<h2 id="_3"><a class="toclink" href="#_3">文档为什么会烂，不只是因为人懒</a></h2>
+<p>很多团队解释文档过期，会归因到“写完没人维护”。这当然存在，但我在做项目时遇到的更深问题不是懒，而是结构错了。</p>
+<p>Agent项目是一个会话操作系统：用户的 CLI agent 被放进 Firecracker microVM 里运行，workspace 文件在 VM 内读写，数据再持久化到对象存储。这个系统里有很多会反复变化的取舍，比如：文件读写到底走 VM 还是直接走对象存储？agent loop 放在宿主机还是 VM 里？VM 是否需要网络接口？这些问题每一个都不是“现在代码长什么样”这么简单。</p>
+<p>一篇普通设计文档常常混着三类信息：</p>
+<ul>
+<li>现在系统怎么工作。</li>
+<li>当初为什么这么设计。</li>
+<li>以前怎么做，后来为什么废弃。</li>
+</ul>
+<p>这三类信息的生命周期完全不同。</p>
+<p>“现在系统怎么工作”必须跟着代码变。代码改了，这部分就要改，甚至要删旧内容。</p>
+<p>“当初为什么这么设计”应该冻结。它记录的是某个时间点的判断：当时有哪些约束，试过哪些方案，为什么选了这个。后来证明判断不完整，也不应该回头把旧记录改成“我们早就知道”，而应该追加新的决策把它取代。</p>
+<p>“以前怎么做”是历史。它不应该混在当前态里误导实现，但也不能丢，因为下次有人问“为什么不走那条路”时，历史能阻止团队重踩旧坑。</p>
+<p>如果这三类信息焊在一篇文档里，每次改代码都会陷入两难：改当前态时顺手改掉历史，原因链丢了；不敢改历史，当前态又开始腐烂。很多文档就是这样坏掉的。</p>
+<h2 id="_4"><a class="toclink" href="#_4">我借用了事件溯源的心智模型</a></h2>
+<p>最后我给项目的文档体系借了一个数据库领域的模型：Event Sourcing。</p>
+<p>事件溯源的核心不是“保存当前余额”，而是保存一串不可变事件。余额只是事件流重放后的投影。比如账户当前有 100，不直接把“100”当成唯一真相，而是保存“+50、+30、+20”这些事件。这样你不仅知道现在是多少，还能回答为什么是这个数、上周三是多少、是谁改的。</p>
+<p>搬到文档上，对应关系很自然：</p>
+<table>
+<thead>
+<tr>
+<th>事件溯源概念</th>
+<th>文档里的角色</th>
+<th>回答的问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>projection</td>
+<td>current</td>
+<td>现在是什么样</td>
+</tr>
+<tr>
+<td>event log</td>
+<td>decisions / journal</td>
+<td>为什么变成这样</td>
+</tr>
+<tr>
+<td>old projection</td>
+<td>history</td>
+<td>以前是什么样，为什么废弃</td>
+</tr>
+</tbody>
+</table>
+<p>关键不是目录名，而是这句话：</p>
+<p><strong>current 不是真相源，它只是当前投影。真相是那串不可变的决策和变更事件。</strong></p>
+<p>一旦接受这个模型，文档维护会简单很多。</p>
+<p>current 可以大胆改。它只描述当前系统，不背历史包袱。旧方案删掉，不等于信息丢失，因为历史和决策链还在。</p>
+<p>decisions 不能随手改。它记录的是当时的判断。新的判断来了，就追加新决策，并标明取代了哪条旧决策。</p>
+<p>history 不参与实现。它的价值是解释“为什么这条路已经走过、为什么后来放弃”。</p>
+<p>这套结构不是为了好看，而是为了让 agent 读文档时少拿错东西。agent 需要当前态时，就去 current；需要原因链时，再看 decisions；不应该在一篇混杂文档里猜哪段是现在、哪段是过去。</p>
+<h2 id="_5"><a class="toclink" href="#_5">只分三类还不够，还要控制粒度</a></h2>
+<p>事件溯源系统还有一个现实问题：事件流会变长。你不可能把每一次微小字段调整都写成架构决策，否则文档事件流会退化成 git log。</p>
+<p>我在项目里把变化分成三层：</p>
+<table>
+<thead>
+<tr>
+<th>粒度</th>
+<th>例子</th>
+<th>记录方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>细变化</td>
+<td>改字段名、修 bug、无取舍的重构</td>
+<td>git commit，加上必要的 current 更新</td>
+</tr>
+<tr>
+<td>中变化</td>
+<td>有明确取舍，但还不到架构级</td>
+<td>追加到 journal</td>
+</tr>
+<tr>
+<td>粗变化</td>
+<td>推翻旧方案、改变系统边界</td>
+<td>写成正式决策记录，并把旧方案归档</td>
+</tr>
+</tbody>
+</table>
+<p>判据很直接：<strong>这次变化以后，未来的人或 agent 会不会问“为什么这么选”？</strong></p>
+<p>如果会，就至少进 journal。如果只是普通实现细节，就别污染 journal。journal 的价值在于留下取舍，而不是记录每一行代码为什么改。</p>
+<p>粗粒度决策通常也不是凭空出现的。它更像一次 snapshot：某个主题在 journal 里累积了几条中粒度变化，到了某个临界点，再 fold 成一篇正式决策。正式决策反向引用这些变化，说明“这不是拍脑袋，是这些问题一路累积出来的”。</p>
+<h2 id="_6"><a class="toclink" href="#_6">一个具体例子：文件读写路径为什么改了五轮</a></h2>
+<p>抽象说完，讲一个Agent项目里最有代表性的例子：workspace 文件读写路径。</p>
+<p>早期的设计里，VM 启动很慢。一次冷启动可能要几十秒，里面包括拉取 workspace、启动 Firecracker、挂载文件系统、等待 agent 就绪。为了“改一个文件”就启动整台 VM，代价太高。</p>
+<p>所以当时做了一套离线直写机制：VM 不在线时，控制面可以直接写对象存储；VM 在线时，写入走 VM。为了避免双写冲突，还要有写权租约、stale 数据防护、scoped 凭证、失败降级。这个方案不是纸面设计，代码也落过地，单 direct write 逻辑就有几百行。</p>
+<p>在当时，它是合理的。因为它解决的是“VM 太贵，所以不能每次文件操作都拉 VM”这个前提。</p>
+<p>后来前提变了。</p>
+<p>我们把 VM 做成预热池，裸金属上实测取用到就绪大约 443ms。这个数字一出来，原来那套离线直写的存在理由就开始动摇：</p>
+<blockquote>
+<p>裸金属启动已经很快了，还需要不开 VM 直接操作对象存储吗？</p>
+</blockquote>
+<p>离线直写那套复杂度不是免费的：双路径要维护，租约要正确，stale 防护要可靠，凭证边界要守住，所有读写路径还要让人和 agent 都理解。如果拉起 VM 已经是亚秒级，那么继续保留双路径就是在为一个已经失效的前提付复杂度税。</p>
+<p>最后我们做了一个大决策：<strong>workspace 的读、写、执行都经 VM，VM 成为唯一入口。</strong></p>
+<p>这个变化在文档体系里应该怎么留下痕迹？</p>
+<p>current 里不再保留“离线直写”作为当前机制。当前态只写：所有 workspace 文件操作经 VM，停机后的持久化由宿主机完成。</p>
+<p>旧的离线直写决策不删除。它被标记为已被新决策取代，保留当时的背景：为什么需要它，解决了什么问题，后来哪个前提失效。</p>
+<p>历史里保留读写路径演化时间线：从粗粒度委托，到读写分叉，到离线直写，再到 VM 唯一入口。这样下次有人问“为什么不直接写对象存储，不是更快吗”，答案不是靠某个人解释，而是能从文档里读到：试过，落地过，后来因为 VM 取用成本下降而删掉。</p>
+<p>这个例子让我确认了一件事：好的文档体系不是让 current 永远不删旧内容，而是让<strong>删 current 时不丢失原因链</strong>。</p>
+<h2 id="agent"><a class="toclink" href="#agent">为什么这对 agent 更重要</a></h2>
+<p>人读到过期文档时，通常会有怀疑：这段是不是旧的？代码是不是已经改了？我要不要搜一下实现？</p>
+<p>agent 不一定会这样。它很可能把上下文里的说明当成强信号，然后生成一段“看上去合理”的代码。最麻烦的是，这类错误常常不是语法错误，而是接到了旧路径、旧字段、旧抽象上。它可能能编译，甚至局部测试能过，但系统语义已经偏了。</p>
+<p>这也是为什么我不想把文档维护讲成“知识管理”。在 agent 参与开发后，文档更像一个运行时依赖：</p>
+<ul>
+<li>过期 current 像返回旧值的 API。</li>
+<li>混杂历史像类型不清的输入。</li>
+<li>丢失决策链像没有 changelog 的依赖升级。</li>
+</ul>
+<p>如果一个依赖会被程序调用，我们会要求它有版本、边界和测试。文档进入 agent 上下文后，也应该至少有清楚的职责边界和变更纪律。</p>
+<h2 id="_7"><a class="toclink" href="#_7">这套方法怎么落地</a></h2>
+<p>最小版本不需要工具，三个目录加一条纪律就够：</p>
+<table>
+<thead>
+<tr>
+<th>目录</th>
+<th>只放什么</th>
+<th>不放什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>current</td>
+<td>当前系统如何工作，关键代码路径，操作入口</td>
+<td>大段历史、已废弃方案、长篇原因讨论</td>
+</tr>
+<tr>
+<td>decisions</td>
+<td>已拍板的取舍，背景，备选方案，取代关系</td>
+<td>当前实现细节流水账</td>
+</tr>
+<tr>
+<td>history</td>
+<td>废弃方案、演化时间线、踩坑记录</td>
+<td>当前实现依据</td>
+</tr>
+</tbody>
+</table>
+<p>然后给每次改动做分流：</p>
+<ol>
+<li>无取舍的小改动：只改代码和 current。</li>
+<li>有取舍的变化：追加 journal，说明触发、选择、影响。</li>
+<li>推翻旧边界的大变化：写正式决策，标记取代关系，把旧文档移到 history。</li>
+</ol>
+<p>还有一条很重要：把“改代码后同步文档”写进工作定义，而不是作为善后事项。对人类团队，这可以是 code review checklist。对 agent 协作，这应该是它进入仓库后能读到的工作规则：改前先看 current，改后按粒度更新文档。</p>
+<h2 id="_8"><a class="toclink" href="#_8">我不认为这是新发明</a></h2>
+<p>这套方法的组成部分都很成熟：</p>
+<ul>
+<li>Event Sourcing 提供“当前态是投影、事件流才是真相”的心智模型。</li>
+<li>ADR 提供“决策记录 append-only、后来用新决策取代旧决策”的习惯。</li>
+<li>Keep a Changelog 提供“先累积 Unreleased，再 cut release”的节奏感。</li>
+<li>Diátaxis 提醒我们把 reference 和 explanation 分开。</li>
+</ul>
+<p>我做的只是把它们组合到 agent 开发场景里：current 给 agent 一个干净的当前投影；decisions 给人和 agent 一条可追溯原因链；history 防止旧坑被反复重踩。</p>
+<p>如果团队已经被“文档总是过期、同一个决策反复讨论、agent 按旧说明写错代码”折磨，这个模型值得一试。它不要求一开始就上工具。先把一篇混杂文档拆成 current / decisions / history，收益通常就会出现。</p>
+<p>文档可靠了，它才配进 agent 的上下文。否则它不是帮助 agent 的知识，而是一个很隐蔽的错误注入点。</p>
+<h2 id="agent_1"><a class="toclink" href="#agent_1">附录：我在 Agent项目 里的真实目录</a></h2>
+<h3 id="_9"><a class="toclink" href="#_9">根部入口文件</a></h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>作用</th>
+<th>公开化后的内容要点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>.kiro/steering/rules.md or CLAUDE.md</code></td>
+<td>给 agent 看的工作纪律</td>
+<td>写清楚 agent 动代码前先读什么，改代码后如何同步文档，以及哪些系统红线不能破。</td>
+</tr>
+<tr>
+<td><code>docs/README.md</code></td>
+<td>文档系统总入口</td>
+<td>解释 <code>current / decisions / history</code> 三层结构，并告诉读者不同问题应该去哪里找答案。</td>
+</tr>
+<tr>
+<td><code>docs/decisions/MAINTENANCE.md</code></td>
+<td>文档演化规则</td>
+<td>定义细变化、中变化、大变化分别如何记录，什么时候写 journal，什么时候 fold 成正式架构决策。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_10"><a class="toclink" href="#_10">文档目录结构</a></h3>
+<pre><code class="language-text">.
+├── README.md
+├── .kiro/steering/rules.md or CLAUDE.md
+└── docs/
+    ├── README.md
+    ├── current/
+    │   ├── 00-overview.md
+    │   ├── 10-frontend/
+    │   ├── 20-control-plane.md
+    │   ├── 30-host-and-vm.md
+    │   ├── 40-..90-*.md
+    │   ├── requirements.md
+    │   ├── glossary.md
+    │   ├── pending-work.md
+    │   └── risks.md
+    ├── decisions/
+    │   ├── README.md
+    │   ├── MAINTENANCE.md
+    │   ├── JOURNAL.md
+    │   └── AD-01..AD-26-*.md
+    └── history/
+        ├── README.md
+        ├── decisions-timeline.md
+        ├── deprecated-paths.md
+        ├── read-write-path-evolution.md
+        ├── poc-archive.md
+        └── superseded-by-layers/
+</code></pre>
+<h3 id="kirosteeringrulesmd-or-claudemd"><a class="toclink" href="#kirosteeringrulesmd-or-claudemd"><code>.kiro/steering/rules.md or CLAUDE.md</code> 核心内容</a></h3>
+<pre><code class="language-text"># agent 工作纪律
+
+&gt; 本仓库的 agent 工作约定。**动代码前先读本篇 + `docs/current/00-overview.md`。**
+
+## 文档是可靠依赖（最高优先级纪律）
+
+文档按**事件溯源模型**组织，三目录各管一件事，**别混**：
+
+| 要知道 | 去哪 |
+|---|---|
+| **现在是什么样、怎么工作、对应哪段代码** | `docs/current/` — 改代码/定位 bug 的**主要依据** |
+| **为什么这么定** | `docs/decisions/` — AD-NN 快照 + `JOURNAL.md` 流水账 |
+| **曾经怎么做、为何废弃** | `docs/history/` |
+
+**改代码前**：
+1. 先读 `docs/current/00-overview.md` → 按分层导航找到所在层 → 翻那一篇，层内 §1 形态 → §2 模块 → §3 库表 → §4 接口 → §5 主流程定位。
+2. **以 current + 代码为准，不以记忆/旧印象为准**。current 文档若与代码不符，是文档该更新（按下方流程），不是猜。
+
+**改代码后**（维护模型详见 `docs/decisions/MAINTENANCE.md`，必须遵守）：
+- **细变化**（改字段/修 bug/重构，对外行为无取舍）→ git commit 写清 + 更新 current 对应段（现状 + `文件名::函数名`，不写行号）。
+- **中变化**（有取舍的子决策）→ `docs/decisions/JOURNAL.md` 追加一条（触发/变化/取舍/影响 current/关联/状态）+ 更新 current。
+- **大变化**（架构级/推翻旧决策）→ fold 成新 `AD-NN`（§1 反向引用累积的 JOURNAL 条目）+ 旧设计进 history + 旧 AD 标 `⛔已取代` + 更新 current。
+- **current 永远只描述当下**，历史在 JOURNAL/history/AD 里。
+
+&gt; 核心：current 是事件流的最新投影；大决策由小变化累积 fold 而来，**小变化一条不丢**。
+&gt; 「讨论过的反复说、踩过的坑再踩」的根治 = 决策必落 ADR/JOURNAL、现状必落 current 并对代码核实。
+
+## 工程约定
+
+- 文档主体用中文（命令/API/标识符保留原文）；当前态 `docs/current/`、过程归档 `docs/history/`、决策 `docs/decisions/`。
+
+</code></pre>
+<h3 id="maintenancemd"><a class="toclink" href="#maintenancemd"><code>MAINTENANCE.md</code> 的粒度规则</a></h3>
+<pre><code class="language-text"># 文档维护模型：快照 + 流水账 + 滚动合并（事件溯源式）
+
+&gt; **这是 `docs/` 三目录如何随代码演化的权威规范。改代码/写设计前先读这一篇。**
+&gt; 思路源自事件溯源（Event Sourcing, Fowler）的 **snapshotting（滚动快照）**：当前状态是事件流的投影，
+&gt; 事件日志（每一次变化）才是真相；周期性快照 + 增量事件流，攒够再 fold 成新快照。
+
+---
+
+## 0. 一句话心法
+
+&gt; **current 是投影（永远只描述&quot;现在&quot;），不是真相源。**
+&gt; **真相 = 所有变化事件**：细变化进 git、中变化进 `JOURNAL.md`、大变化 fold 成 `AD-NN`。
+&gt; **大决策不是凭空蹦出，是小变化累积到临界点的提炼**——所以小变化一条都不能丢。
+
+## 1. 三目录职责（各管一件事，不再混）
+
+| 目录 | 只回答 | 写法 | 类比（Wikipedia） |
+|---|---|---|---|
+| `current/` | **现在是什么样、怎么工作、对应哪段代码** | 流动投影，随代码变；**剥离&quot;为什么&quot;，指向 ADR** | 正文（永远最新） |
+| `decisions/` | **为什么这么定**（AD 快照 + JOURNAL 增量事件流） | AD 冻结；JOURNAL append-only | Talk 页（为什么） |
+| `history/` | **曾经怎么做、为何废弃** | 冻结，可追溯 | History（每次编辑留痕） |
+
+current 是改代码、定位 bug 的**主要依据**——所以它的&quot;现状描述 + 代码路径 file:line&quot;必须与代码一致，
+失真比 ADR 过期更危险。
+
+## 2. 三层粒度：任何变化都落到其一，一条不丢
+
+| 粒度 | 是什么 | 记到哪 | 例 |
+|---|---|---|---|
+| **细** | 改字段 / 修 bug / 重构，**对外行为无取舍** | git commit（message 写清）+ 更新 current 对应段 | 改个 Valkey key 命名 |
+| **中** | **有取舍的子决策**（够得上&quot;为什么这么选&quot;，但够不上架构级） | **`JOURNAL.md` 追加一条** + 更新 current | HP-D5 双向自愈 / EP-D11 固定 upstream |
+| **粗** | 架构级 / 推翻旧决策 | **fold 成新 AD-NN**（见 §4）+ 更新 current + 旧设计进 history | AD-20 一切经 VM |
+
+&gt; ⚠️ 判据：细变化**不进 JOURNAL**（否则流水账退化成 git log，丢失信号）。
+&gt; 只有&quot;带取舍、值得日后回看为什么这么选&quot;的中变化才进 JOURNAL。拿不准 → 进 JOURNAL（宁记勿丢）。
+
+## 3. JOURNAL.md 条目格式（中粒度事件）
+
+新条目放最上（倒序）。子决策编号延续既有族（HP-/EP-/SE-/WD-/AV-… 各自递增）：
+
+```
+### YYYY-MM-DD · HP-D7 · 一句话标题
+- 触发：什么事/什么对话引出这次变化（可链 #issue）
+- 变化：具体改了什么
+- 取舍：有哪些选项、为什么选这个（这是中变化的灵魂，必写）
+- 影响 current：../current/30-host-and-vm.md §2.3
+- 关联：AD-24、#259
+- 状态：✅已落地 ｜ ⏳待合并入 AD ｜ ✅已并入 AD-27
+```
+
+## 4. 合并（rolling snapshot）：流水账 fold 成 AD
+
+两条触发，对应两种现实情况：
+
+### 4a. 主动合并（攒够了，到合适时候）
+JOURNAL 里某主题攒够（如 host liveness 累积了 HP-D5/D6/D7… 数条），把这串提炼成**新 AD**：
+1. 新建 `AD-NN-*.md`，§1「决策前现状」**反向引用**这串 JOURNAL 条目（&quot;本决策由 HP-D5~D7 累积暴露的问题触发&quot;）。
+2. 被合并的 JOURNAL 条目状态改 `✅已并入 AD-NN`（**不删**，留追溯）。
+3. README 登记表加行；AD §7 链 current。
+
+### 4b. 被动合并（一次大变更触发）
+来了个大变更必须立 AD，就把之前累积、指向它的 JOURNAL 条目**收拢进新 AD 的 §1** 作&quot;累积触发/决策前现状&quot;。
+（AD-20 就是 SE 一串子决策的快照——这是范式。）
+
+### 取代旧决策时（4a/4b 都可能涉及）
+- 旧 AD 状态标 `⛔ 已取代`（**不删**，可追溯）；新 AD §6 写清取代关系。
+- 旧设计文档/段落 → 移进 `history/`（加&quot;被 AD-NN 取代&quot;头注 + 来源链）。
+- current 删旧现状、写新现状，§关联 ADR 指向新 AD-NN。
+
+## 5. 日常 checklist（改代码时照这个走）
+
+1. **先翻 current 对应层**找现状（不是翻一堆碎片文档）。
+2. 改完代码 → **更新 current 对应段**（现状 + 代码路径 file:line）。
+3. 这次变化**有取舍吗**？有 → **JOURNAL 追加一条**；没有 → 只 git commit。
+4. 累积到**动了架构 / 推翻了旧决策**？→ 按 §4 fold 成 AD + 旧的进 history。
+5. **current 永远只描述当下，不留历史包袱**——历史在 JOURNAL/history/AD 里。
+
+---
+
+## 行业参考（这套模型的出处）
+- **Event Sourcing + Snapshotting**（Fowler / Greg Young）：current=投影、事件日志=真相、周期性快照 + 增量。
+- **Keep a Changelog**：`Unreleased` 段持续累积小改动，攒够 cut 一个 release。
+- **ADR superseding 链**（Michael Nygard）：决策 append-only，新标 supersedes、旧标 superseded by。
+- **Diátaxis**（Procida）：reference（怎么工作=current）与 explanation（为什么=decisions）分离。
+- **C4 model / arc42**：当前态按层结构化呈现。
+- **Wikipedia 正文/Talk/History 三件套**：现状 / 为什么 / 每次变更留痕，职责分离。
+</code></pre>
+<h2 id="_11"><a class="toclink" href="#_11">资料来源</a></h2>
+<ol>
+<li>Aristidis Vasilopoulos, <em>Codified Context: Infrastructure for AI Agents in a Complex Codebase</em>, arXiv:2602.20478v1, 2026. https://arxiv.org/abs/2602.20478v1</li>
+<li>Ahmed Nusayer Ashik, Shaowei Wang, Tse-Hsun Chen, Muhammad Asaduzzaman, Yuan Tian, <em>When LLMs Lag Behind: Knowledge Conflicts from Evolving APIs in Code Generation</em>, arXiv:2604.09515v1, 2026. https://arxiv.org/abs/2604.09515v1</li>
+<li>Martin Fowler, <em>Event Sourcing</em>. https://martinfowler.com/eaaDev/EventSourcing.html</li>
+<li>Michael Nygard, <em>Documenting Architecture Decisions</em>. https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions</li>
+<li>Keep a Changelog. https://keepachangelog.com/en/1.1.0/</li>
+<li>Diátaxis documentation framework. https://diataxis.fr/</li>
+</ol>
+    </article>
+    <footer class="site-footer">
+      <p><a href="../index.html">← 返回 Wdd&#x27;s Blog 文章列表</a></p>
+      <p>© Wdd&#x27;s Blog · 本页由 <code>build.py</code> 从 Markdown 静态渲染。</p>
+    </footer>
+  </main>
+
+  <aside class="toc-sidebar" id="toc" aria-label="文章大纲">
+    <div class="toc-sidebar__inner">
+      <p class="toc-sidebar__title">大纲</p>
+      <nav class="toc-nav">
+        <ul>
+<li><a href="#_2">为什么文档会变成工程依赖</a></li>
+<li><a href="#_3">文档为什么会烂，不只是因为人懒</a></li>
+<li><a href="#_4">我借用了事件溯源的心智模型</a></li>
+<li><a href="#_5">只分三类还不够，还要控制粒度</a></li>
+<li><a href="#_6">一个具体例子：文件读写路径为什么改了五轮</a></li>
+<li><a href="#agent">为什么这对 agent 更重要</a></li>
+<li><a href="#_7">这套方法怎么落地</a></li>
+<li><a href="#_8">我不认为这是新发明</a></li>
+<li><a href="#agent_1">附录：我在 Agent项目 里的真实目录</a><ul>
+<li><a href="#_9">根部入口文件</a></li>
+<li><a href="#_10">文档目录结构</a></li>
+<li><a href="#kirosteeringrulesmd-or-claudemd">.kiro/steering/rules.md or CLAUDE.md 核心内容</a></li>
+<li><a href="#maintenancemd">MAINTENANCE.md 的粒度规则</a></li>
+</ul>
+</li>
+<li><a href="#_11">资料来源</a></li>
+</ul>
+      </nav>
+    </div>
+  </aside>
+</div>
+
+<div class="toc-backdrop" id="toc-backdrop" hidden></div>
+
+<script src="../assets/toc.js" defer></script>
+</body>
+</html>

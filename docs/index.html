@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Wdd&#x27;s Blog — 一点点心得和总结">
+<title>Wdd&#x27;s Blog</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#posts">跳到文章列表</a>
+
+<header class="site-header">
+  <div class="site-header__inner">
+    <a class="site-brand" href="index.html">Wdd&#x27;s Blog</a>
+  </div>
+</header>
+
+<main class="home">
+  <header class="home__hero">
+    <h1 class="home__title">Wdd&#x27;s Blog</h1>
+    <p class="home__tagline">一点点心得和总结</p>
+  </header>
+
+  <section class="post-list" id="posts" aria-label="文章列表">
+    <article class="post-card">
+      <a class="post-card__link" href="posts/pairec-on-aws.html">
+        <h2 class="post-card__title">在 AWS 上落地一套生产级推荐系统:基于开源 PaiRec 的全链路改造实践</h2>
+        <p class="post-card__summary">把一套 PAI-Rec 风格的推荐链路(召回 → 过滤 → 排序 → 重排 → 回流 + A/B 实验)完整搬到 AWS。 这篇文章不讲&quot;推荐算法&quot;,讲的是工程落地:AWS 上做推荐缺什么、有哪些落地路线、为什么选 Pa…</p>
+        <p class="post-card__meta"><time datetime="2026-06-26">2026-06-26</time> · 约 5527 字 · 阅读约 16 分钟</p>
+      </a>
+    </article>
+    <article class="post-card">
+      <a class="post-card__link" href="posts/agent-memory-model.html">
+        <h2 class="post-card__title">Agent 记忆系统的思考</h2>
+        <p class="post-card__summary">Agent 记忆系统的核心不是“让模型记住更多”，而是把不同类型的状态放回正确的位置，并在需要时把它们重新带回工作现场。</p>
+        <p class="post-card__meta"><time datetime="2026-06-25">2026-06-25</time> · 约 6543 字 · 阅读约 19 分钟</p>
+      </a>
+    </article>
+    <article class="post-card">
+      <a class="post-card__link" href="posts/running-untrusted-agents-firecracker.html">
+        <h2 class="post-card__title">把不可信 agent 放进 Firecracker：零凭证 microVM 的工程账</h2>
+        <p class="post-card__summary">我构建的是一个持续会话式的 agent 运行环境。每个用户有一个 workspace，agent 可以读写文件、调用工具、安装依赖、执行命令；在 coding 场景下，它还会运行 bash、npm install、构建脚…</p>
+        <p class="post-card__meta"><time datetime="2026-06-24">2026-06-24</time> · 约 3655 字 · 阅读约 10 分钟</p>
+      </a>
+    </article>
+    <article class="post-card">
+      <a class="post-card__link" href="posts/docs-as-reliable-dependency.html">
+        <h2 class="post-card__title">文档即可靠依赖：我在项目里用事件溯源管理文档</h2>
+        <p class="post-card__summary">这篇写的是一个很具体的问题：当 AI agent 开始参与真实代码库开发时，文档不再只是给人看的说明书。它会进入 agent 的决策链路，变成一种会影响代码产出的依赖。</p>
+        <p class="post-card__meta"><time datetime="2026-06-23">2026-06-23</time> · 约 4713 字 · 阅读约 13 分钟</p>
+      </a>
+    </article>
+  </section>
+
+  <footer class="site-footer home__footer">
+    <p>© Wdd&#x27;s Blog · 共 4 篇 · 由 <code>build.py</code> 静态生成。</p>
+  </footer>
+</main>
+</body>
+</html>

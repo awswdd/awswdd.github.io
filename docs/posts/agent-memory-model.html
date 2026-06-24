@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Agent 记忆系统的核心不是“让模型记住更多”，而是把不同类型的状态放回正确的位置，并在需要时把它们重新带回工作现场。">
+<title>Agent 记忆系统的思考 · Wdd&#x27;s Blog</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#content">跳到正文</a>
+
+<header class="site-header">
+  <div class="site-header__inner">
+    <a class="site-brand" href="../index.html">Wdd&#x27;s Blog</a>
+    <button id="toc-toggle" class="toc-toggle" aria-expanded="false" aria-controls="toc">
+      <span class="toc-toggle__icon" aria-hidden="true"></span>
+      <span class="toc-toggle__label">目录</span>
+    </button>
+  </div>
+  <div class="reading-progress" id="reading-progress"></div>
+</header>
+
+<div class="layout">
+  <main class="content" id="content">
+    <article class="article">
+      <header class="article__hero">
+        <a class="article__back" href="../index.html">← 返回文章列表</a>
+        <p class="article__eyebrow">工程笔记</p>
+        <h1 class="article__title">Agent 记忆系统的思考</h1>
+        <p class="article__byline">内容创作：wdd · 美化编辑：codex (gpt-5.5) · 审核：wdd</p>
+        <p class="article__meta">约 6543 字 · 阅读约 19 分钟</p>
+      </header>
+      <p>我最早不是从“要不要上向量库”开始思考 agent memory 的，而是从一个更产品化的问题开始：如果一个助手式 agent 不只是聊天，还能使用工具、读写资料、调用外部系统，必要时执行代码，并且要在多次对话之间保持连续性，产品里到底需要哪些边界？</p>
+<p>这里说的不是只会写代码的专用 agent。代码能力只是助手能使用的一类工具。更一般的场景可能是研究资料整理、客户跟进、数据分析、合同审阅、工单处理、运营自动化，或者在多个系统之间推进一件事。用户真正期待的不是“每次都从零开始回答得不错”，而是这个助手逐渐理解自己的项目、偏好、约束和历史决定；它产生的内容也不应该只埋在聊天记录里，而应该能被人浏览、编辑、二次检索，最后沉淀成个人或团队的知识资产。</p>
+<p>以我当前的项目设计为例，我更愿意把它理解成一个面向助手式 agent 的会话操作系统：它运行在多租户环境里，必须先保证租户之间的数据和执行隔离；它要给 agent 一个可恢复的工作现场，承载资料、工具连接和中间产物；它还要把对话中形成的稳定结论沉淀到知识库，而不是让它们散落在一次次 session 里。于是，几个概念不是为了产品名词好看，而是分别承担不同责任：</p>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>它解决的问题</th>
+<th>如果没有它</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>workspace</td>
+<td>首先是多租户系统里的隔离和工作边界，其次才是 agent 的任务现场；它承载资料、工具、执行环境和中间产物</td>
+<td>租户隔离、权限范围、执行现场和任务连续性会混在一起</td>
+</tr>
+<tr>
+<td>知识库 / topic</td>
+<td>让助手产生的稳定内容可以被人浏览、编辑、二次检索，并按知识域长期组织</td>
+<td>有价值的结论只能埋在聊天记录里，无法成为可复用资产</td>
+</tr>
+<tr>
+<td>session</td>
+<td>承载一次对话过程，并表达这次对话应该延续旧上下文，还是作为临时问题隔离处理</td>
+<td>系统会默认“历史都相关”或“新对话都无关”，两种都会伤害体验</td>
+</tr>
+<tr>
+<td>memory</td>
+<td>在这些边界之间维持连续性，决定什么进入下次上下文、什么沉淀为知识、什么只留在历史里</td>
+<td>所有状态都会被粗暴地塞进“记忆”这个筐</td>
+</tr>
+</tbody>
+</table>
+<p>这个问题和普通聊天产品不同。聊天产品里的记忆多是历史摘要、用户偏好或长期对话记录；能使用工具的助手还会面对任务状态、资料版本、外部系统结果、失败尝试、决策约束、待办和可复用流程。把这些都叫 memory，会掩盖真正的建模问题。</p>
+<p>所以我现在更愿意把 agent memory 的第一层问题写成一句话：</p>
+<blockquote>
+<p>Agent 记忆系统的核心不是“让模型记住更多”，而是把不同类型的状态放回正确的位置，并在需要时把它们重新带回工作现场。</p>
+</blockquote>
+<p>如果这个问题没拆清楚，后面的技术会一起变形：向量库召回不该召回的旧事实，长上下文把过程噪声当知识，图数据库把尚未定义清楚的关系复杂化，文件记忆变成没人治理的便签墙。</p>
+<h2 id="workspace-session"><a class="toclink" href="#workspace-session">先拆开 workspace、知识库和 session</a></h2>
+<p>产品里同时有 workspace、知识库和 session，并不意味着这三个概念应该互相套在一起。早期做 agent 记忆时，最容易犯的错就是把隔离边界、知识组织、对话过程绑成一个层级结构。比如：用户先建一个 topic，然后在 topic 里开 session，session 再关联 workspace。这个模型乍看很顺，但实际会马上出现问题：用户只是想临时问一句，却被迫先选知识域；一次客户分析同时产生“行业知识”和“客户决策”两类结论，不应该被单个 topic 吃掉；同一个 workspace 可能承载多个知识域，同一个知识域也可能跨多个 workspace 复用。更关键的是，workspace 不能被 topic 或 session 随意决定，因为它还承担租户隔离、权限范围和执行现场的职责。</p>
+<p>这里真正需要拆开的，是三条正交轴：</p>
+<table>
+<thead>
+<tr>
+<th>轴</th>
+<th>它回答的问题</th>
+<th>在助手式 agent 里的含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>workspace</td>
+<td>谁能看、在哪里工作、哪些状态要隔离</td>
+<td>租户/工作区隔离、任务资料、工具连接、执行环境、持久化边界</td>
+</tr>
+<tr>
+<td>知识库 / topic</td>
+<td>哪些内容值得沉淀，应该归到哪个知识域</td>
+<td>人可浏览、可编辑、可搜索的长期知识组织</td>
+</tr>
+<tr>
+<td>session</td>
+<td>这次交流如何使用上下文</td>
+<td>一段对话过程，以及“延续旧话题”或“临时隔离”的上下文选择</td>
+</tr>
+</tbody>
+</table>
+<p>workspace 是工作世界，也是隔离世界。它决定 agent 能看见什么、能调用什么、在哪个环境里行动、哪些中间产物被保留。它可能是代码目录，也可能是研究资料包、客户账户、数据分析项目、工单队列或自动化运行环境。在多租户产品里，workspace 还要约束数据访问和执行范围，不能只被当成一个“项目分类”。</p>
+<p>知识库是资产世界。它的目标不是替 session 做归档，而是把助手和用户一起产生的稳定结论变成人可以再次进入的知识空间：可以浏览，可以改，可以搜索，可以被下一次任务引用。topic 可以作为知识库里的组织维度，用来表达知识属于哪个领域，但它不应该成为权限边界，也不应该决定 agent 在哪里运行。</p>
+<p>session 是对话世界，但它不是天然的长期记忆边界。同样是一次新输入，用户可能希望它接着上周的一个方案继续推演，也可能只是临时问一个无关问题，不希望污染当前工作上下文。于是 session 至少要表达两层含义：一是这段对话过程发生了什么，二是这次对话和既有上下文是什么关系。前者用于追溯和审计，后者用于决定上下文是否延续、隔离或分叉。</p>
+<p>拆分后，很多问题会从“产品交互问题”变成“归属建模问题”：</p>
+<table>
+<thead>
+<tr>
+<th>如果混在一起</th>
+<th>表面问题</th>
+<th>实际后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>topic 绑定 workspace</td>
+<td>用户必须先选知识域才能工作</td>
+<td>语义分类影响隔离和执行环境，临时任务和长期任务都别扭</td>
+</tr>
+<tr>
+<td>session 绑定长期知识</td>
+<td>一段对话要不要多 topic</td>
+<td>多归属落在错误对象上，应该归属的是 note，不是 session</td>
+</tr>
+<tr>
+<td>session 默认继承全部历史</td>
+<td>用户只是临时问一句</td>
+<td>无关历史进入上下文，甚至污染当前 topic 和 working memory</td>
+</tr>
+<tr>
+<td>session 默认完全隔离</td>
+<td>用户想继续上次话题</td>
+<td>之前的约束、决策和待办没有带入，助手表现得像失忆</td>
+</tr>
+<tr>
+<td>workspace 吃掉历史</td>
+<td>新 workspace 要不要迁移旧对话</td>
+<td>过程记录被误当成环境状态，迁移和审计都会混乱</td>
+</tr>
+<tr>
+<td>topic 兼做权限边界</td>
+<td>同名 topic 或跨团队 topic 混用</td>
+<td>检索过滤、权限和知识分类互相污染</td>
+</tr>
+</tbody>
+</table>
+<p>所以，“一段对话能不能属于多个 topic”不是好问题。真正会长期沉淀的是 note，不是 session。一段对话可以产生多条 note，其中一条属于市场判断，另一条属于客户决策；多归属应该发生在 <code>note &lt;-&gt; topic</code> 上。“新 session 要不要继承旧上下文”也不能用一个默认规则回答。更合理的做法，是让 session 有 continuation、temporary、fork 之类的上下文模式：继续讨论时带回相关 working memory 和 note；临时问题只保留最小上下文；分叉探索则继承起点但不直接污染原来的工作状态。</p>
+<p>把三条轴拆开以后，系统里最重要的一句话就清楚了：</p>
+<blockquote>
+<p>workspace 管隔离和工作现场，知识库管可复用资产，session 管对话过程和上下文关系。</p>
+</blockquote>
+<p>这句话比“记忆用什么库”更重要。因为一旦这三者混在一起，后面的召回、写入、迁移和权限都会跟着混。</p>
+<h2 id="agent_1"><a class="toclink" href="#agent_1">为什么记忆对助手式 agent 重要</a></h2>
+<p>带着这个问题再看外部资料，它们的位置会更清楚：不是替我们决定产品结构，而是校准为什么 memory 不能被简化成聊天历史或向量库。助手式 agent 的价值来自连续性：它要知道用户是谁、正在推进什么、哪些决定已经做过、哪些限制不能突破、哪些结论已经过期。如果每次对话都重新解释一遍背景，助手就只是一个更会说话的搜索框；如果把所有历史都塞进上下文，它又会被旧事实、噪声和无关过程拖垮。</p>
+<p><a href="https://arxiv.org/abs/2402.17753">LoCoMo</a> 评估长期对话记忆：每段对话平均约 300 turns、9K tokens，最多跨 35 个 sessions，用来测试长程问答、事件摘要和多模态对话生成。论文的结论也比较克制：长上下文模型和 RAG 能改善结果，但模型仍然明显落后于人类，尤其在长程时间和因果关系理解上有挑战。这说明长期、多 session 的对话连续性不是产品幻想，而是已经被单独拿出来评测的问题。</p>
+<p><a href="https://arxiv.org/abs/2504.19413">Mem0 论文</a> 进一步把问题推向工程侧：它通过动态抽取、整合和检索显著信息来维护长期对话一致性，并报告相对 OpenAI baseline 26% 的 LLM-as-a-Judge 提升、相比 full-context 方法 91% 更低 p95 latency 和超过 90% token cost 节省。这个结果不能证明某个架构适合所有产品，但能支持一个更稳的判断：选择性、结构化、持久的 memory，通常比“全量历史塞回上下文”更接近生产系统需要。</p>
+<p>另一类资料关注记忆结构和工作界面。<a href="https://arxiv.org/abs/2501.13956">Zep 论文</a> 和 <a href="https://github.com/getzep/graphiti">Graphiti README</a> 强调 temporal knowledge graph、事实有效期、provenance，以及 semantic、keyword、graph traversal 的混合检索。这条路线对时间变化和多跳关系很有价值，但它也意味着更高的抽取、建模、调试和运维成本。Anthropic 的 <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Effective context engineering for AI agents</a> 以 Claude Code 为例，提到用 <code>CLAUDE.md</code> 放置上下文，并通过 <code>glob</code>、<code>grep</code> 等工具在运行环境中即时检索文件。<a href="https://docs.letta.com/letta-code/memory/">Letta Code memory 文档</a> 也给出类似思路：agent 可以跨 sessions、days、months 使用，并 self-edits its memory；memory blocks 可以投影为本地 markdown 文件，由 MemFS 提供版本历史和冲突处理。这些例子来自以代码工作面为主的产品，但真正有价值的启发更通用：当 agent 本来就在某个真实工作面里行动时，工作面本身可能就是最自然的记忆界面。</p>
+<p>这些资料放在一起，真正可带走的是约束，不是模板：长期记忆不能只靠全量上下文硬塞；向量检索只是候选信号，不能单独决定什么进入上下文；时间有效性和来源追溯是真问题，不是数据库字段装饰；有真实 workspace 或外部工作面的 agent，必须认真考虑工作面本身作为记忆界面的可能性；图关系和情景记忆很重要，但未必应该作为 v1 的起点。</p>
+<h2 id="_1"><a class="toclink" href="#_1">记忆至少要分成三层</a></h2>
+<p>三条轴拆清楚以后，记忆分层就比较自然了。不是所有记忆都应该走同一条路径。一次数据分析当前卡在哪个口径，和一个 SDK 的鉴权方式，不是一类东西；一个客户跟进流程的操作步骤，和一次失败尝试的现场记录，也不是一类东西。我倾向于把它分成三层：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>载体</th>
+<th>归属</th>
+<th>进入上下文的方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>长期知识</td>
+<td>note</td>
+<td>topic，并受 tenant/workspace scope 约束</td>
+<td>检索召回</td>
+</tr>
+<tr>
+<td>当前工作状态</td>
+<td>working memory</td>
+<td>workspace</td>
+<td>当前 workspace 小规模全量注入</td>
+</tr>
+<tr>
+<td>程序性能力</td>
+<td>skills</td>
+<td>tenant 或 workspace</td>
+<td>先注入索引，需要时再读正文</td>
+</tr>
+</tbody>
+</table>
+<p>长期 note 回答“过去沉淀过什么可复用知识”。它会增长，所以需要检索；它可能跨任务复用，所以需要 topic；它可能只在某个 workspace 内有效，所以还要 scope；它可能被新事实推翻，所以不能只有 append，还要能失效。working memory 回答“这件事现在进行到哪里”。它不应该变成第二个知识库，目标也不是未来语义相似时被召回，而是当前 workspace 每次开工时都必须看见。比如：</p>
+<ul>
+<li>这个客户账户已经发过两轮跟进邮件，下一步等法务反馈。</li>
+<li>这份市场分析已经确认数据口径，不能再混用 GMV 和净收入。</li>
+<li>上次尝试调用外部系统失败，原因是权限范围不够。</li>
+<li>某个服务的 public API 暂时不能改，下一步要补回归测试。</li>
+</ul>
+<p>这些信息量不大，但漏掉的代价很高。一个 todo、constraint 或 pitfall 没带进上下文，agent 就可能重复踩坑。所以 working memory 更适合按 kind 分组后全量注入，而不是走向量 top-k。skills 回答“某类任务应该怎么做”。它是程序性记忆，不是事实记忆；正文可能很长，不适合每轮都塞进上下文，更好的方式是先给模型一个索引，命中后再读取正文。</p>
+<p>更具体地说，三层记忆的写入和读取规则应该不同：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>典型写入触发</th>
+<th>默认读取方式</th>
+<th>不该做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>note</td>
+<td>用户确认的事实、从资料中稳定抽取出的结论、被复用过的决策依据</td>
+<td>按 query 检索，并受 scope、validity、authority 过滤</td>
+<td>不要把每轮摘要都当长期知识</td>
+</tr>
+<tr>
+<td>working memory</td>
+<td>待办、约束、当前进度、阻塞点、下次启动必须知道的状态</td>
+<td>当前 workspace 小规模全量注入</td>
+<td>不要用向量相似度决定是否带入</td>
+</tr>
+<tr>
+<td>skills</td>
+<td>可重复执行的流程、检查清单、操作惯例</td>
+<td>常驻索引，按需读取正文</td>
+<td>不要和事实 note 混在同一池子里</td>
+</tr>
+</tbody>
+</table>
+<p>这比“记忆分 semantic、episodic、procedural”更接近工程决策：长期知识需要召回，当前工作状态需要显式保留，程序性能力需要按需加载。三者混在一起，写入策略、召回策略和失效策略都会互相污染。</p>
+<h2 id="_2"><a class="toclink" href="#_2">记忆最危险的不是忘记，而是过期</a></h2>
+<p>长期记忆有一个反直觉的问题：最危险的不是没有记住，而是记住了曾经正确、现在错误的东西。旧 API、旧部署方式、旧数据库 schema、旧产品决策，都可能在某个时间点是真的。直接删除会切断历史解释，继续默认召回会误导当前任务。所以长期 note 不能只做 append，至少要表达有效期和替代关系：</p>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>valid_at</code></td>
+<td>这条记忆从什么时候开始有效</td>
+</tr>
+<tr>
+<td><code>invalid_at</code></td>
+<td>这条记忆从什么时候开始不再默认有效</td>
+</tr>
+<tr>
+<td><code>superseded_by</code></td>
+<td>哪条新记忆取代了它</td>
+</tr>
+</tbody>
+</table>
+<p>失效不是删除，而是改变默认召回行为。正常任务只召回当前有效的 note；需要追溯历史时，再沿着 <code>superseded_by</code> 找回旧事实和替换原因。来源也一样重要：一条 note 是用户明确说的，还是 agent 从日志里总结的？来自当前工作资料、CRM 记录、外部网页，还是工具执行结果？这些来源的权威度不同。</p>
+<p>一个能治理冲突的 note 至少应该有这些字段：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>解决的问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>scope</code></td>
+<td>这条记忆在哪些 tenant、workspace、topic 下可见</td>
+</tr>
+<tr>
+<td><code>valid_at</code> / <code>invalid_at</code></td>
+<td>默认召回时是否仍然有效</td>
+</tr>
+<tr>
+<td><code>superseded_by</code></td>
+<td>被哪条新事实替代，历史链路怎么追</td>
+</tr>
+<tr>
+<td><code>source_kind</code> / <code>source_pointer</code></td>
+<td>事实来自用户、文件、外部系统、网页还是工具结果</td>
+</tr>
+<tr>
+<td><code>authority</code></td>
+<td>冲突时谁更可信，例如用户确认高于 agent 总结</td>
+</tr>
+</tbody>
+</table>
+<p>这些字段不是 schema 装饰，而是让系统能回答两个问题：这条记忆为什么存在？它和另一条记忆冲突时，应该信谁？</p>
+<h2 id="_3"><a class="toclink" href="#_3">向量检索只能负责“找候选”</a></h2>
+<p>很多记忆系统会把问题简化成：把历史切成 chunks，存 embedding，查询时 top-k 召回。这个方案可以作为起点，但不能作为完整答案。embedding similarity 只能告诉你“语义上像”，不能告诉你：</p>
+<ul>
+<li>这条记忆是不是当前 workspace 的？</li>
+<li>它是不是已经过期？</li>
+<li>它的来源是否可信？</li>
+<li>它是不是和当前任务相关，而不只是措辞相似？</li>
+<li>它是不是和另一个事实存在取代关系？</li>
+</ul>
+<p>更稳妥的召回路径应该是多信号的，而且过滤顺序要前置：</p>
+<ol>
+<li>先按 tenant、workspace、topic、权限缩小候选空间。</li>
+<li>用向量检索找语义候选。</li>
+<li>用全文检索找精确信号，比如客户名、订单号、错误码、函数名、文件名、工单号。</li>
+<li>用 RRF 或类似方式融合候选。</li>
+<li>过滤 <code>invalid_at</code> 已生效、scope 不匹配、authority 过低的 note。</li>
+<li>再按时间、新旧替代关系、来源权威度和任务相关性排序。</li>
+</ol>
+<p>这套机制不复杂，但它承认了一件关键事实：</p>
+<blockquote>
+<p>embedding similarity 只是候选信号，不是上下文准入证。</p>
+</blockquote>
+<p>如果把 top-k 直接塞进上下文，记忆系统会变成污染源。它看起来“记得很多”，但 agent 收到的是范围不清、时间不明、来源不明的一堆旧材料。长上下文只能降低检索压力，不能替系统判断事实是否过期，也不能自动区分当前任务状态和长期知识。把更多历史塞进去，有时候只是把召回错误换成上下文污染。</p>
+<h2 id="working-memory"><a class="toclink" href="#working-memory">Working memory 应该贴近助手的工作面</a></h2>
+<p>长期 note 适合数据库和混合检索，因为它要跨 topic、跨任务，要处理 scope、validity、provenance 和排序。working memory 的目标不同：它不是在海量历史里召回相似内容，而是让当前 workspace 每次开工时恢复状态。它通常小、密、任务私有，应该全量注入。</p>
+<p>我更愿意把 working memory 当成“当前任务状态界面”，而不是记忆库。它至少应该有几个稳定区块：</p>
+<table>
+<thead>
+<tr>
+<th>区块</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>goal</code></td>
+<td>当前 workspace 正在完成什么，不包含长期愿景</td>
+</tr>
+<tr>
+<td><code>constraints</code></td>
+<td>已确认的限制、不能做的事、权限边界</td>
+</tr>
+<tr>
+<td><code>progress</code></td>
+<td>已完成的关键步骤和当前卡点</td>
+</tr>
+<tr>
+<td><code>next_actions</code></td>
+<td>下次启动时应该先做什么</td>
+</tr>
+<tr>
+<td><code>pitfalls</code></td>
+<td>已经踩过、不能重复的坑</td>
+</tr>
+<tr>
+<td><code>open_questions</code></td>
+<td>需要用户或外部系统确认的问题</td>
+</tr>
+</tbody>
+</table>
+<p>如果 agent 的主要工作面是文件系统，working memory 可以是一份状态文件，比如 <code>AGENT_STATE.md</code> 或 <code>.agent/memory.md</code>。文件方案的优势是 agent 和用户都能直接检查，状态跟任务资料一起持久化，不必等后台 worker 在 turn 结束后再整理。但文件需要格式约束、大小限制、冲突处理和审计；多个 session 同时修改同一个 workspace 时，最后写赢会丢状态，用户也可能手动写坏格式。</p>
+<p>如果 agent 的主要工作面是 CRM、工单系统、浏览器、数据平台或自动化编排系统，working memory 更适合是一张结构化任务状态卡。载体可以不同，但边界不应该变：长期 note 更像知识库，working memory 更像当前任务状态界面。两者可以共享记忆抽象，但不应该共享同一套召回逻辑。</p>
+<h2 id="_4"><a class="toclink" href="#_4">图和情景记忆：延后实现，但预留边界</a></h2>
+<p>如果只用 SQL、全文检索和向量检索，可以解决很多“找到相关 note”的问题。但它们不擅长回答关系链问题。比如：</p>
+<blockquote>
+<p>那个为了解决 B 问题提出、后来被 C 决策推翻的方案，当时依据是什么？</p>
+</blockquote>
+<p>这不是单条 note 检索，而是“问题 -&gt; 方案 -&gt; 决策 -&gt; 取代关系 -&gt; 当时证据”的多跳查询。<code>superseded_by</code> 只能表达线性替代，不能表达完整实体关系。</p>
+<p>所以我不会把“不做图”包装成“图没用”。更准确的说法是：如果系统还在 v1，优先把状态归属、失效、来源和基础召回做好，可能比一开始就上 GraphRAG 更务实。但当真实用户开始频繁问实体关系、时间链、多跳因果时，图结构就不再是装饰，而是能力边界。</p>
+<p><a href="https://www.mindstudio.ai/blog/agent-memory-problem-vector-search-not-enough">MindStudio 关于 agent memory 的文章</a> 把记忆分成 working、episodic、semantic、procedural 等类型。按这个分类看，note 接近 semantic，skills 接近 procedural，working memory 对应 working。但 episodic，也就是“发生过什么”，经常没有被认真建模。情景记忆的问题和图关系类似：不是第一天就必须做成完整产品，但如果完全忽略，系统后面会缺一块解释能力。</p>
+<p>系统可能记录了 turns、steps、工具调用和命令结果，但审计日志不等于情景记忆。情景记忆要回答的是：</p>
+<ul>
+<li>上次类似方案为什么失败？</li>
+<li>当时的关键观察是什么？</li>
+<li>用户后来纠正了什么？</li>
+<li>为什么那个方向没有继续？</li>
+</ul>
+<p>这类信息如果完全不建模，agent 会只记得结论，不记得尝试路径。但如果把所有过程都塞进记忆，又会膨胀得很快。比较实际的做法，是先只把高价值事件变成情景记忆：失败尝试、关键观察、用户纠正、工具异常、被推翻的方案。也就是说，episodic memory 不应该等于“保存所有轨迹”，而应该是从轨迹里挑出以后真的会影响决策的事件。</p>
+<h2 id="_5"><a class="toclink" href="#_5">记忆系统要和上下文布局分开</a></h2>
+<p>还有一个工程边界很容易被忽略：记忆系统不应该直接决定 prompt 长什么样。记忆模块应该回答：“有哪些高信号材料？”agent loop 才回答：“这些材料怎么摆进模型窗口？”</p>
+<p>比如：</p>
+<ul>
+<li>working memory 可以放在 system prefix 或开工上下文里。</li>
+<li>最新 todo 可以放在靠近用户请求的位置。</li>
+<li>skills index 可以常驻，正文按需读取。</li>
+<li>note hits 可以按相关度和 token 预算插入。</li>
+<li>过期 note 默认不进入上下文，但审计/复盘时可以查。</li>
+</ul>
+<p>这样拆开以后，宿主从 CLI agent 切到平台原生 loop，或者从单 agent 扩展到子 agent，记忆模块都不必重写。它只需要产出结构化的 memory bundle；具体怎么排版、缓存、裁剪，是 agent loop 的事。</p>
+<p>这个边界也能防止另一个问题：为了适配某个 prompt 模板，把记忆模型本身设计歪。上下文布局会变，模型窗口会变，prompt cache 策略也会变；状态归属不应该跟着这些实现细节一起漂。</p>
+<h2 id="_6"><a class="toclink" href="#_6">最后可以用这几个问题校验设计</a></h2>
+<p>如果要判断一个 agent 记忆设计是否站得住，我会先问这些问题：</p>
+<ol>
+<li>这条状态属于 workspace、知识库/topic，还是 session？</li>
+<li>它是长期知识、当前工作状态，还是程序性能力？</li>
+<li>它是否可能过期？过期后是删除、隐藏，还是被新事实 supersede？</li>
+<li>它的来源是什么？和另一条记忆冲突时，谁更可信？</li>
+<li>它应该被全量注入，还是通过检索召回？</li>
+<li>它是否需要跨任务或项目复用？如果需要，scope 怎么限制？</li>
+<li>agent 能不能写它？如果能写，谁负责质量闸门？</li>
+<li>它进入上下文的位置，是记忆系统决定，还是 agent loop 决定？</li>
+<li>这次 session 是延续旧话题、临时隔离，还是从某个上下文分叉？</li>
+</ol>
+<p>这些问题比“用不用向量库”更靠前。向量库、图数据库、长上下文、文件记忆、后台 worker、agent self-editing 都可以用，但它们分别解决候选生成、关系建模、上下文预算、状态界面、异步整理和自维护问题。没有状态归属模型，工具越强，错误状态传播得越快。</p>
+<h2 id="_7"><a class="toclink" href="#_7">我现在会怎么取舍</a></h2>
+<p>如果今天重新做一个助手式 agent 的记忆系统，我会从一个相对保守的版本开始：</p>
+<ol>
+<li>先把 workspace、知识库/topic、session 拆开。不要让 topic 决定运行环境，不要让 session 承担长期知识归属，也不要让 session 默认继承或默认隔离全部历史；上下文关系应该显式建模。</li>
+<li>长期 note 用结构化存储加混合召回。它必须有 scope、validity、provenance 和 supersede。向量检索可以用，但只当候选生成；全文检索、过滤和重排同样重要。</li>
+<li>working memory 先按 workspace 建模，并根据 agent 的工作面选择载体。它可以是 <code>.agent/memory.md</code> 这类工作状态文件，也可以是 CRM 里的任务状态卡、数据平台里的分析备注，或同步到数据库供 UI 和审计使用。关键是不要把它做成另一个向量库。</li>
+<li>skills 独立出来。不要把长流程说明塞进长期 note，也不要每轮都注入完整正文。先给索引，命中后读取。</li>
+<li>episodic memory 和图关系都不急着作为 v1 的核心，但要预留位置。前者至少要能把失败尝试、用户纠正、关键观察这类高价值事件从普通日志里提升出来；后者可以先用 <code>superseded_by</code>、source pointer 和实体标签解决一部分问题，等真实查询证明多跳关系是高频需求，再引入图结构。</li>
+</ol>
+<p>这个路线的重点不是功能堆叠，而是让每一层都有清楚的写入条件、读取方式和失效规则。</p>
+<h2 id="_8"><a class="toclink" href="#_8">回到状态归属</a></h2>
+<p>Agent 记忆不是单纯的 RAG 问题，也不是上下文窗口问题。它更像一个状态系统：哪些状态属于隔离后的工作现场，哪些应该沉淀进可浏览、可检索的知识库，哪些只是一次对话过程；哪些事实仍然有效，哪些已经被取代；哪些内容应该稳定进入上下文，哪些内容只在需要时召回。</p>
+<p>拆清楚以后，技术选型会收敛：workspace、知识库/topic、session 是三条正交轴；note、working memory、skills 是三类不同记忆；validity 和 provenance 决定记忆能不能被信任；检索负责找候选，重排和过滤决定能不能进入上下文；文件、数据库、图和长上下文只是实现手段。</p>
+<p>所以我现在更愿意把 agent memory 的第一原则写成一句话：</p>
+<blockquote>
+<p>先把状态放对地方，再讨论怎么让模型记住。</p>
+</blockquote>
+<p>这不是一个新技术名词，而是设计顺序：先决定状态归属，再决定存储、检索、图关系和上下文布局。</p>
+    </article>
+    <footer class="site-footer">
+      <p><a href="../index.html">← 返回 Wdd&#x27;s Blog 文章列表</a></p>
+      <p>© Wdd&#x27;s Blog · 本页由 <code>build.py</code> 从 Markdown 静态渲染。</p>
+    </footer>
+  </main>
+
+  <aside class="toc-sidebar" id="toc" aria-label="文章大纲">
+    <div class="toc-sidebar__inner">
+      <p class="toc-sidebar__title">大纲</p>
+      <nav class="toc-nav">
+        <ul>
+<li><a href="#workspace-session">先拆开 workspace、知识库和 session</a></li>
+<li><a href="#agent_1">为什么记忆对助手式 agent 重要</a></li>
+<li><a href="#_1">记忆至少要分成三层</a></li>
+<li><a href="#_2">记忆最危险的不是忘记，而是过期</a></li>
+<li><a href="#_3">向量检索只能负责“找候选”</a></li>
+<li><a href="#working-memory">Working memory 应该贴近助手的工作面</a></li>
+<li><a href="#_4">图和情景记忆：延后实现，但预留边界</a></li>
+<li><a href="#_5">记忆系统要和上下文布局分开</a></li>
+<li><a href="#_6">最后可以用这几个问题校验设计</a></li>
+<li><a href="#_7">我现在会怎么取舍</a></li>
+<li><a href="#_8">回到状态归属</a></li>
+</ul>
+      </nav>
+    </div>
+  </aside>
+</div>
+
+<div class="toc-backdrop" id="toc-backdrop" hidden></div>
+
+<script src="../assets/toc.js" defer></script>
+</body>
+</html>

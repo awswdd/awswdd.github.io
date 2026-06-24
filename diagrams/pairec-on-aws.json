@@ -1,0 +1,84 @@
+{
+  "_comment": "每篇文章的图：键为该文中第 N 个『ASCII 流程图块』（即纯 ``` 围栏且含框线/箭头字符的块，从 0 计），值为对应的 Mermaid 源（数组按行拼接）。build.py 会用这些 Mermaid 替换原 ASCII 图；带语言标记的代码块（go/json/sql）不受影响。",
+  "0": [
+    "flowchart TD",
+    "  A[\"多路召回并发<br/>u2i · i2i · 向量 · 热门 · 兜底\"] --> B[\"结果合并 + 去重 + 打散\"]",
+    "  B --> C[\"按版本取特征\"]",
+    "  C --> D[\"拼成模型输入 → 精排打分\"]",
+    "  D --> E[\"重排<br/>业务置顶 · 多样性 · 强插\"]",
+    "  AB[\"A/B 分流贯穿全程 + 埋点归因\"] -.-> A",
+    "  AB -.-> D",
+    "  AB -.-> E"
+  ],
+  "1": [
+    "flowchart LR",
+    "  P[\"PaiRec\"] -->|\"普通 HTTP · localhost:9000\"| S",
+    "  subgraph S [\"smproxy（sidecar）\"]",
+    "    direction TB",
+    "    S1[\"TFServing JSON → SageMaker 调用\"] --> S2[\"SigV4 签名\"]",
+    "  end",
+    "  S -->|\"已签名请求\"| E[\"SageMaker Endpoint<br/>rec-ranker\"]",
+    "  E -.->|\"scores[] 回填 item.score\"| P"
+  ],
+  "2": [
+    "flowchart LR",
+    "  P[\"PaiRec（Go）\"] -->|\"HTTP POST /recall<br/>{uid, scene, size, features}\"| R[\"recall-svc<br/>（本例 Java / Spring Boot）\"]",
+    "  R -.->|\"{items:[{id, score, retrieve_id}]}\"| P"
+  ],
+  "3": [
+    "flowchart TD",
+    "  A[\"Crawler 编目 raw\"] --> B[\"数据加工：清洗 + 宽表 + CTR<br/>+ 分组/全局热门（Spark SQL）\"]",
+    "  B --> S[\"样本生成<br/>label(SQL) + 特征(feature-ops UDF)\"]",
+    "  B --> I[\"i2i<br/>ItemCF 共现 + 余弦\"]",
+    "  B --> V[\"向量<br/>Spark ML ALS\"]",
+    "  S --> Q[\"质量门禁<br/>Glue Data Quality 规则集\"]",
+    "  I --> Q",
+    "  V --> Q",
+    "  Q -->|\"不达标\"| X[\"作业失败<br/>不触发训练\"]",
+    "  B -.->|\"并行 fan-out\"| V",
+    "  class X fail;",
+    "  classDef fail fill:#fdecea,stroke:#d93025,color:#8a1c12;"
+  ],
+  "4": [
+    "flowchart TD",
+    "  G[\"Glue 质量门禁 SUCCEEDED\"] -->|\"EventBridge 规则\"| P[\"StartPipelineExecution<br/>rec-offline-pipeline\"]",
+    "  P --> T[\"TrainRanker<br/>SKLearn · 读 s3://.../samples\"]",
+    "  T --> R[\"RegisterModel → Model Registry<br/>rec-ranker-group · 审批 Approved 才部署\"]"
+  ],
+  "5": [
+    "flowchart LR",
+    "  G[\"Glue 产出\"] --> S[\"S3<br/>Parquet 源 · 持久真相\"]",
+    "  S --> Y[\"seed_sync<br/>SageMaker Processing · 幂等\"]",
+    "  Y --> R[\"Redis / OpenSearch<br/>可重建副本\"]"
+  ],
+  "6": [
+    "flowchart TB",
+    "  Client[\"客户端\"] --> ALB[\"ALB（IP 白名单）\"]",
+    "  subgraph Online [\"在线推理 · EKS Auto Mode（rec-eks/rec）\"]",
+    "    direction TB",
+    "    ALB --> AR[\"ab-router<br/>分流 / 翻译 / 埋点<br/>正交分层 murmur3%1000 · scene 翻译\"]",
+    "    AR --> PR[\"PaiRec<br/>召回 → 过滤 → 特征 → 精排 → 重排\"]",
+    "    PR --> RDS_C[\"ElastiCache Redis<br/>特征 / 召回 / 热门\"]",
+    "    PR --> OS[\"OpenSearch<br/>向量 k-NN\"]",
+    "    PR --> SM[\"smproxy → SageMaker Endpoint<br/>精排\"]",
+    "    PR --> RC[\"recall-svc<br/>Java 算法 · HTTP 代理\"]",
+    "  end",
+    "  AR -->|\"埋点 expose/click/convert\"| MSK[\"MSK → Firehose → S3\"]",
+    "  MSK --> ATH[\"Athena<br/>按 layer/variant 算 CTR/CVR + z-test\"]",
+    "  subgraph Offline [\"离线数据处理 · Glue + Glue Workflows（serverless Spark · cron）\"]",
+    "    direction LR",
+    "    RAW[\"S3 / raw\"] --> CAT[\"编目\"] --> CLEAN[\"清洗 + CTR + 热门（SQL）\"]",
+    "    CLEAN --> SAMP[\"样本(SQL+UDF) ‖ i2i ‖ 向量(ALS)\"] --> DQ[\"质量门禁（Glue DQ）\"]",
+    "  end",
+    "  subgraph Model [\"离线模型 · SageMaker Pipeline\"]",
+    "    direction LR",
+    "    TR[\"TrainRanker\"] --> RG[\"RegisterModel\"] --> MR[\"Model Registry<br/>审批后部署 Endpoint\"]",
+    "  end",
+    "  DQ -->|\"EventBridge（门禁 SUCCEEDED）\"| TR",
+    "  MR -.->|\"部署\"| SM",
+    "  CP[\"控制面：RDS PostgreSQL<br/>草稿 / 已发布版本 / 指针\"] -.->|\"同源消费『已发布版本』\"| AR",
+    "  CP -.-> EDGE[\"端侧：S3 版本化制品 + CloudFront 签名 URL<br/>+ SHA256 + 增量包（A/B配置/特征/向量/端侧模型）\"]",
+    "  DATA[\"数据面：S3（Parquet 源 · 真相）\"] -->|\"seed_sync 幂等上线\"| RDS_C",
+    "  DATA --> OS"
+  ]
+}
